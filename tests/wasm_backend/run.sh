@@ -58,7 +58,7 @@ invoke() {
 for pkg in */; do
 	pkg=${pkg%/}
 	[ "$pkg" = "$(basename "$OUT")" ] && continue
-	[ "$pkg" = "host_env" ] && continue
+	case $pkg in host_env|bench|out) continue ;; esac  # not test packages
 	ls "$pkg"/*.odin >/dev/null 2>&1 || continue
 
 	if [ ! -f "$pkg/calls.txt" ]; then

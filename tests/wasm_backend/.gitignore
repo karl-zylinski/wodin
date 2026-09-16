@@ -1,2 +1,5 @@
 out/
 !run.sh
+!sweep.sh
+!upstream_tests.sh
+!bench/run.sh
