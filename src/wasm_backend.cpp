@@ -1603,6 +1603,182 @@ gb_internal void wb_write_le_int(u8 *dst, BigInt const *x, i64 size) {
 }
 
 // Serializes a constant of `type` into `dst` (which is zeroed and type_size_of(type) bytes)
+// A constant bit_field literal: each field's value truncated to its width and
+// put at its bit offset in the backing storage, as a store to the field would
+// put it. `dst` holds the type's bytes little endian, so bit k of the storage
+// is bit k%8 of byte k/8, whether the backing is one integer or an array of
+// them. False for what cannot be done this way (a backing type of the other
+// endianness, a field that is not a constant), as the LLVM backend asserts.
+gb_internal bool wb_write_const_bit_field(wbModule *m, Type *type, Ast *compound, u8 *dst) {
+	ast_node(cl, CompoundLit, compound);
+	Type *bt = base_type(type);
+	GB_ASSERT(bt->kind == Type_BitField);
+	if (is_type_different_to_arch_endianness(core_type(bt->BitField.backing_type))) {
+		return false;
+	}
+	for_array(i, cl->elems) {
+		Ast *elem = cl->elems[i];
+		i64 index = cast(i64)i;
+		Ast *value_expr = elem;
+		if (elem->kind == Ast_FieldValue) {
+			ast_node(fv, FieldValue, elem);
+			Selection sel = lookup_field(bt, fv->field->Ident.interned, false);
+			GB_ASSERT(sel.is_bit_field && sel.index.count == 1);
+			index = sel.index[0];
+			value_expr = fv->value;
+		}
+		TypeAndValue tav = type_and_value_of_expr(value_expr);
+		if (tav.mode != Addressing_Constant) {
+			return false;
+		}
+		u64 bits = 0;
+		switch (tav.value.kind) {
+		case ExactValue_Invalid: bits = 0;                                          break;
+		case ExactValue_Bool:    bits = tav.value.value_bool ? 1 : 0;               break;
+		case ExactValue_Integer: bits = wb_big_int_bits(&tav.value.value_integer); break;
+		default:                 return false;
+		}
+		i64 bit_offset = bt->BitField.bit_offsets[index];
+		i64 bit_size   = bt->BitField.bit_sizes[index];
+		for (i64 b = 0; b < bit_size && b < 64; b++) {
+			if ((bits >> b) & 1) {
+				i64 k = bit_offset + b;
+				dst[k/8] |= cast(u8)(1u << (k%8));
+			}
+		}
+	}
+	return true;
+}
+
+gb_internal Type *wb_union_variant_holding(Type *u, Type *v);
+
+// The variant a constant of union `u` is really of, when the checker recorded
+// `u` itself as the variant -- which it does for a conversion to the union seen
+// through another conversion (`B(int(4))` on its way into an `A`). The
+// expression says, once the conversions to unions are peeled off; failing
+// that a compound literal's own type; failing that the value's kind, when
+// exactly one variant can hold it. Null when it cannot be told.
+gb_internal Type *wb_union_const_real_variant(Type *u, ExactValue const &v, Ast *expr) {
+	Type *bt = base_type(u);
+	if (expr != nullptr) {
+		Ast *e = unparen_expr(expr);
+		for (;;) {
+			if (e->kind != Ast_CallExpr || e->CallExpr.args.count != 1) {
+				break;
+			}
+			TypeAndValue pt = type_and_value_of_expr(e->CallExpr.proc);
+			if (pt.mode != Addressing_Type || !is_type_union(pt.type)) {
+				break;
+			}
+			e = unparen_expr(e->CallExpr.args[0]);
+		}
+		Type *et = type_of_expr(e);
+		if (et != nullptr) {
+			if (is_type_untyped(et)) {
+				et = default_type(et);
+			}
+			if (!are_types_identical(base_type(et), bt) && (union_is_variant_of(bt, et) || wb_union_variant_holding(bt, et) != nullptr)) {
+				return et;
+			}
+		}
+	}
+	if (v.kind == ExactValue_Compound) {
+		Type *ct = type_of_expr(v.value_compound);
+		if (ct != nullptr && !are_types_identical(base_type(ct), bt)) {
+			return ct;
+		}
+	}
+	Type *found = nullptr;
+	for (Type *vt : bt->Union.variants) {
+		bool fits = false;
+		switch (v.kind) {
+		case ExactValue_Bool:      fits = is_type_boolean(vt); break;
+		case ExactValue_Integer:   fits = is_type_integer(vt) || is_type_enum(vt); break;
+		case ExactValue_Float:     fits = is_type_float(vt); break;
+		case ExactValue_String:    fits = is_type_string(vt) || is_type_cstring(vt); break;
+		case ExactValue_Pointer:   fits = is_type_pointer(vt) || is_type_multi_pointer(vt); break;
+		case ExactValue_Procedure: fits = is_type_proc(vt); break;
+		case ExactValue_Typeid:    fits = is_type_typeid(vt); break;
+		default: break;
+		}
+		if (fits) {
+			if (found != nullptr) {
+				return nullptr; // two could hold it: the value alone cannot say which
+			}
+			found = vt;
+		}
+	}
+	return found;
+}
+
+// The variant of union `u` that is, or (as a union itself) holds, the type `v`
+gb_internal Type *wb_union_variant_holding(Type *u, Type *v) {
+	u = base_type(u);
+	for (Type *vt : u->Union.variants) {
+		if (union_variant_index_types_equal(v, vt)) {
+			return vt;
+		}
+		if (is_type_union(vt) && wb_union_variant_holding(vt, v) != nullptr) {
+			return vt;
+		}
+	}
+	return nullptr;
+}
+
+gb_internal Type *wb_union_variant_holding(Type *u, Type *v);
+
+// A constant of array type given one value of the element type, which then
+// fills every element (`C: [2][2]A : B(C{})`): anything that is not a literal
+// of the array type itself
+gb_internal bool wb_const_is_splat(Type *array_type, ExactValue const &value) {
+	// What the value is of: a literal's own type, else the variant a union
+	// conversion recorded. Not the wrapping expression's type, which the
+	// checker has already made the array's
+	ExactValue v = value;
+	Ast *expr = nullptr;
+	while (v.kind == ExactValue_Variant) {
+		if (expr == nullptr) {
+			expr = v.value_variant;
+		}
+		v = v.value_variant->tav.value;
+	}
+	Type *vt = nullptr;
+	if (v.kind == ExactValue_Compound) {
+		vt = type_of_expr(v.value_compound);
+	} else if (v.variant_type != nullptr) {
+		vt = v.variant_type;
+	} else if (expr != nullptr) {
+		vt = type_of_expr(expr);
+	}
+	if (vt == nullptr || is_type_untyped(vt)) {
+		return false;
+	}
+	// The name matters to a union, whose variants are the named types
+	// (`C`, not `struct {}`); the shape is what matters against the array
+	Type *vb = base_type(vt);
+	if (are_types_identical(vb, base_type(array_type))) {
+		return false; // a literal of the array itself
+	}
+	// the value is one element, at whatever depth of nesting (`[2][2]A`
+	// given a `B(C{})`, which is a variant of a variant of A)
+	Type *e = base_type(array_type);
+	for (;;) {
+		switch (e->kind) {
+		case Type_Array:           e = base_type(e->Array.elem);           break;
+		case Type_EnumeratedArray: e = base_type(e->EnumeratedArray.elem); break;
+		case Type_Matrix:          e = base_type(e->Matrix.elem);          break;
+		case Type_SimdVector:      e = base_type(e->SimdVector.elem);      break;
+		default:                   return false;
+		}
+		if (are_types_identical(e, vb)) {
+			return true;
+		}
+		if (e->kind == Type_Union && (union_is_variant_of(e, vt) || wb_union_variant_holding(e, vt) != nullptr)) {
+			return true;
+		}
+	}
+}
+
 gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &value, u8 *dst) {
 	if (is_type_untyped(type)) {
 		type = default_type(type);
@@ -1642,25 +1818,65 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 	if (bt->kind == Type_Union && value.kind != ExactValue_Invalid) {
 		// Constant union value: the variant's data followed by its tag
 		ExactValue v = value;
-		if (v.kind == ExactValue_Variant) {
+		Ast *expr = nullptr; // the expression the constant came from, when it is known
+		while (v.kind == ExactValue_Variant) {
+			// a conversion to a union of a conversion to a union wraps twice
+			if (expr == nullptr) {
+				expr = v.value_variant;
+			}
 			v = v.value_variant->tav.value;
 		}
 		Type *variant_type = v.variant_type;
 		if (v.kind == ExactValue_Compound) {
 			ast_node(cl, CompoundLit, v.value_compound);
-			if (variant_type == nullptr || are_types_identical(variant_type, type)) {
-				GB_ASSERT(cl->elems.count == 0);
+			if (cl->elems.count == 0 && (variant_type == nullptr || are_types_identical(base_type(variant_type), bt))) {
 				return; // nil
 			}
 		}
 		if (variant_type == nullptr && bt->Union.variants.count == 1) {
 			variant_type = bt->Union.variants[0];
 		}
-		GB_ASSERT_MSG(variant_type != nullptr, "%s :: %s", type_to_string(type), exact_value_to_string(value));
+		if (variant_type == nullptr || are_types_identical(base_type(variant_type), bt)) {
+			// The union itself was recorded as the variant (see
+			// wb_union_const_real_variant), or nothing was
+			Type *real = wb_union_const_real_variant(bt, v, expr);
+			GB_ASSERT_MSG(real != nullptr, "cannot tell the variant of the constant %s of type %s", exact_value_to_string(value), type_to_string(type));
+			variant_type = real;
+		}
 		if (variant_type == t_untyped_nil) {
 			return;
 		}
-		wb_write_const_data(m, variant_type, v, dst);
+		if (!union_is_variant_of(bt, variant_type)) {
+			// A variant of a variant (`Outer(Inner(Inner_Left.a))`, or a
+			// `Maybe(UI)` given an int): written as the variant of this union
+			// that holds it, whose own writing puts the inner tag in place
+			Type *holder = wb_union_variant_holding(bt, variant_type);
+			GB_ASSERT_MSG(holder != nullptr, "%s has no variant holding %s", type_to_string(type), type_to_string(variant_type));
+			variant_type = holder;
+		}
+		ExactValue inner = v;
+		if (is_type_union(variant_type)) {
+			// The variant is a union too: its value's variant is told the same
+			// way, from the expression inside the conversion to it
+			Ast *inner_expr = expr;
+			if (inner_expr != nullptr) {
+				Ast *e = unparen_expr(inner_expr);
+				if (e->kind == Ast_CallExpr && e->CallExpr.args.count == 1) {
+					TypeAndValue pt = type_and_value_of_expr(e->CallExpr.proc);
+					if (pt.mode == Addressing_Type && is_type_union(pt.type)) {
+						inner_expr = e->CallExpr.args[0];
+					}
+				}
+			}
+			if (inner.variant_type == nullptr || are_types_identical(base_type(inner.variant_type), base_type(variant_type)) ||
+			    (!union_is_variant_of(variant_type, inner.variant_type) && wb_union_variant_holding(variant_type, inner.variant_type) == nullptr)) {
+				Type *real = wb_union_const_real_variant(variant_type, inner, inner_expr);
+				if (real != nullptr) {
+					inner.variant_type = real;
+				}
+			}
+		}
+		wb_write_const_data(m, variant_type, inner, dst);
 		if (wb_union_has_tag(bt)) {
 			i64 tag_index = union_variant_index_checked(bt, variant_type);
 			GB_ASSERT(tag_index >= 0);
@@ -1815,17 +2031,24 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 			}
 			for_array(i, cl->elems) {
 				Ast *elem = cl->elems[i];
-				i64 index = cast(i64)i;
 				Ast *value_expr = elem;
+				Type *ft = nullptr;
+				i64 offset = 0;
 				if (elem->kind == Ast_FieldValue) {
+					// `field = value`, where the field may sit in a `using`
+					// member: the selection is a path of indices to follow down
 					ast_node(fv, FieldValue, elem);
 					Selection sel = lookup_field(bt, fv->field->Ident.interned, false);
-					GB_ASSERT(sel.index.count == 1);
-					index = sel.index[0];
+					GB_ASSERT(sel.index.count >= 1);
+					Type *st = bt;
+					for (i32 index : sel.index) {
+						offset += type_offset_of(st, index, &ft);
+						st = base_type(ft);
+					}
 					value_expr = fv->value;
+				} else {
+					offset = type_offset_of(bt, cast(i64)i, &ft);
 				}
-				Type *ft = nullptr;
-				i64 offset = type_offset_of(bt, index, &ft);
 				TypeAndValue tav = type_and_value_of_expr(value_expr);
 				wb_write_const_data(m, ft, tav.value, dst + offset);
 			}
@@ -1846,6 +2069,14 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 			default: break;
 			}
 			i64 elem_size = type_size_of(et);
+			if (bt->kind != Type_FixedCapacityDynamicArray && wb_const_is_splat(type, value)) {
+				// `C: [2][2]A : B(C{})`: one value of the element type, in every element
+				i64 count = type_size_of(type) / gb_max(elem_size, 1);
+				for (i64 k = 0; k < count; k++) {
+					wb_write_const_data(m, et, value, dst + k*elem_size);
+				}
+				return;
+			}
 			if (bt->kind == Type_FixedCapacityDynamicArray) {
 				// [dynamic; N]T{...}: {data: [N]T, len: int}
 				i64 capacity = bt->FixedCapacityDynamicArray.capacity;
@@ -1900,6 +2131,11 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 			}
 			return;
 		}
+		case Type_BitField:
+			if (wb_write_const_bit_field(m, type, node, dst)) {
+				return;
+			}
+			break;
 		case Type_Slice: {
 			// constant slice literal: elements in the data segment
 			Type *et = bt->Slice.elem;
@@ -1995,16 +2231,28 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 	Type *bt = base_type(type);
 	if (bt->kind == Type_Union) {
 		ExactValue v = value;
-		if (v.kind == ExactValue_Variant) {
+		Ast *expr = nullptr;
+		while (v.kind == ExactValue_Variant) {
+			if (expr == nullptr) {
+				expr = v.value_variant;
+			}
 			v = v.value_variant->tav.value;
 		}
-		if (v.kind == ExactValue_Compound && (v.variant_type == nullptr || are_types_identical(v.variant_type, type))) {
+		if (v.kind == ExactValue_Compound && (v.variant_type == nullptr || are_types_identical(base_type(v.variant_type), bt))) {
 			return true; // nil
 		}
-		if (v.variant_type == nullptr) {
-			return bt->Union.variants.count == 1 && wb_can_serialize_const(bt->Union.variants[0], v);
+		Type *variant_type = v.variant_type;
+		if (variant_type == nullptr || are_types_identical(base_type(variant_type), bt)) {
+			// the union recorded as its own variant: resolvable, or not at all
+			variant_type = wb_union_const_real_variant(bt, v, expr);
+			if (variant_type == nullptr) {
+				return false;
+			}
 		}
-		return wb_can_serialize_const(v.variant_type, v);
+		if (is_type_union(variant_type)) {
+			return true; // the inner variant is resolved the same way when written
+		}
+		return wb_can_serialize_const(variant_type, v);
 	}
 	switch (value.kind) {
 	case ExactValue_Bool:
@@ -2012,7 +2260,10 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 	case ExactValue_Float:
 	case ExactValue_Pointer:
 	case ExactValue_Typeid:
-		return wb_is_scalar(type) || is_type_complex(bt) || is_type_quaternion(bt) || type_size_of(type) == 16 ||
+		// 16 bytes: 128-bit integers and bit_sets on them, two words in memory.
+		// `any` is 16 bytes too and is not this: an integer put in an `any` is
+		// a pointer and a typeid, made at startup
+		return wb_is_scalar(type) || is_type_complex(bt) || is_type_quaternion(bt) || (type_size_of(type) == 16 && !is_type_any(bt)) ||
 		       (bt->kind == Type_SimdVector && wb_is_scalar(bt->SimdVector.elem)) ||
 		       (bt->kind == Type_Array && wb_is_scalar(bt->Array.elem)) ||
 		       (bt->kind == Type_EnumeratedArray && wb_is_scalar(bt->EnumeratedArray.elem)) ||
@@ -2026,9 +2277,20 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 		return is_type_string(type) || is_type_cstring(type) || is_type_string16(type) || is_type_cstring16(type) || is_type_array(bt) || is_type_slice(bt);
 	case ExactValue_Procedure:
 		return is_type_proc(bt);
+	case ExactValue_Variant:
 	case ExactValue_Compound:
-		if (value.value_compound->CompoundLit.elems.count == 0) {
+		if (value.kind == ExactValue_Compound && value.value_compound->CompoundLit.elems.count == 0) {
 			return true; // `{}` is the zero value of any type
+		}
+		switch (bt->kind) {
+		case Type_Array:           if (wb_const_is_splat(type, value)) return wb_can_serialize_const(bt->Array.elem, value);           break;
+		case Type_EnumeratedArray: if (wb_const_is_splat(type, value)) return wb_can_serialize_const(bt->EnumeratedArray.elem, value); break;
+		case Type_Matrix:          if (wb_const_is_splat(type, value)) return wb_can_serialize_const(bt->Matrix.elem, value);          break;
+		case Type_SimdVector:      if (wb_const_is_splat(type, value)) return wb_can_serialize_const(bt->SimdVector.elem, value);      break;
+		default: break;
+		}
+		if (value.kind == ExactValue_Variant) {
+			return false; // a union constant reaches here through the union branch above
 		}
 		switch (bt->kind) {
 		case Type_Struct: case Type_Array: case Type_EnumeratedArray: case Type_Slice: case Type_SimdVector: case Type_Matrix:
@@ -2216,6 +2478,17 @@ gb_internal wbValue wb_const(wbProcedure *p, Ast *node, Type *type, ExactValue c
 		if (value.value_compound->CompoundLit.elems.count == 0) {
 			v.i = 0; // `{}`
 			break;
+		}
+		if (base_type(type)->kind == Type_BitField && type_size_of(type) <= 8) {
+			// A bit_field literal with an integer backing is a scalar
+			u8 bytes[8] = {};
+			if (wb_write_const_bit_field(p->module, type, value.value_compound, bytes)) {
+				v.i = 0;
+				for (i64 k = type_size_of(type)-1; k >= 0; k--) {
+					v.i = (v.i << 8) | bytes[k];
+				}
+				break;
+			}
 		}
 		wb_unsupported(p, node, "constant value kind");
 		return wb_value_invalid();

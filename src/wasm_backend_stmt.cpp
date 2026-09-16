@@ -230,6 +230,7 @@ gb_internal void wb_build_assign_stmt(wbProcedure *p, AstAssignStmt *as, Ast *no
 gb_internal void wb_build_return_stmt(wbProcedure *p, AstReturnStmt *rs, Ast *node) {
 	Type *pt = base_type(p->type);
 	isize result_count = pt->Proc.result_count;
+	p->branch_location_pos = ast_token(node).pos; // for #branch_location in the defers
 	if (result_count == 0) {
 		wb_emit_defers_down_to(p, 0);
 		wb_emit_epilogue(p);
@@ -302,6 +303,7 @@ gb_internal void wb_emit_return_values(wbProcedure *p, Array<wbValue> const &val
 
 // Emits a break/continue/fallthrough (also used by `or_break`/`or_continue`)
 gb_internal void wb_emit_branch(wbProcedure *p, TokenKind kind, Ast *label, Ast *node) {
+	p->branch_location_pos = ast_token(node).pos; // for #branch_location in the defers
 	Ast *target_label = nullptr;
 	if (label != nullptr) {
 		Entity *e = entity_of_node(label);
@@ -432,12 +434,16 @@ gb_internal void wb_build_block_stmt(wbProcedure *p, AstBlockStmt *bs, Ast *node
 		wb_push_label(p, bs->label, depth, 0, false);
 		wb_open_scope(p);
 		wb_build_stmt_list(p, bs->stmts);
+		// Defers run at the end of a block report its closing brace as the
+		// branch location, as the LLVM backend does
+		p->branch_location_pos = ast_end_token(node).pos;
 		wb_close_scope(p);
 		wb_pop_label(p);
 		wb_close(p);
 	} else {
 		wb_open_scope(p);
 		wb_build_stmt_list(p, bs->stmts);
+		p->branch_location_pos = ast_end_token(node).pos;
 		wb_close_scope(p);
 	}
 }
@@ -2058,6 +2064,7 @@ gb_internal void wb_build_switch_stmt(wbProcedure *p, AstSwitchStmt *ss, Ast *no
 		wb_push_label(p, ss->label, exit_depth, 0, false, true, fall_depth);
 		wb_open_scope(p);
 		wb_build_stmt_list(p, cc->stmts);
+		p->branch_location_pos = ast_end_token(clauses[i]).pos; // a defer at the clause's end
 		wb_close_scope(p);
 		wb_pop_label(p);
 		wb_br(p, exit_depth);
@@ -2195,6 +2202,7 @@ gb_internal void wb_build_type_switch_stmt(wbProcedure *p, AstTypeSwitchStmt *ss
 		}
 
 		wb_build_stmt_list(p, cc->stmts);
+		p->branch_location_pos = ast_end_token(clauses[i]).pos; // a defer at the clause's end
 		wb_close_scope(p);
 		wb_pop_label(p);
 		wb_br(p, exit_depth);

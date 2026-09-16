@@ -343,13 +343,22 @@ gb_internal wbValue wb_emit_conv_to_union(wbProcedure *p, wbValue v, Type *dst) 
 
 gb_internal wbValue wb_emit_conv_to_any(wbProcedure *p, wbValue v, Type *dst) {
 	Type *src = default_type(v.type);
-	wbAddr res = wb_add_temp(p, dst);
+	// In a startup procedure (a global `any` given a constant) the `any` and
+	// what it points at must outlive the procedure: static storage, not the
+	// frame, which main and everything after it would overwrite
+	wbAddr res = wb_add_temp_or_static(p, dst);
 	if (is_type_untyped_nil(src)) {
 		wb_addr_zero(p, res);
 		return wb_value_memory(res.index, res.offset, dst);
 	}
 	v.type = src;
-	wbAddr data = wb_value_to_addr(p, v);
+	wbAddr data;
+	if (v.kind == wbValue_Memory) {
+		data = wb_value_to_addr(p, v);
+	} else {
+		data = wb_add_temp_or_static(p, src);
+		wb_addr_store(p, data, v);
+	}
 	if (data.kind != wbAddr_Memory) {
 		return wb_conv_unsupported(p, src, dst);
 	}
@@ -2354,10 +2363,21 @@ gb_internal wbValue wb_emit_arith128(wbProcedure *p, Ast *node, TokenKind op, wb
 		return res;
 	}
 	if (op == Token_ModMod) {
-		// ((a % b) + b) % b
-		wbValue r = wb_emit_arith128(p, node, Token_Mod, left, right, operand_type, operand_type);
-		r = wb_emit_arith128(p, node, Token_Add, r, right, operand_type, operand_type);
-		return wb_emit_arith128(p, node, Token_Mod, r, right, operand_type, result_type);
+		// Floored modulo, as for the narrower integers: r = a % b, then
+		// r += b when r is not zero and its sign (the high word's) differs
+		// from b's -- rather than ((a % b) + b) % b, whose sum overflows
+		wbValue r = wb_value_copy(p, wb_emit_arith128(p, node, Token_Mod, left, right, operand_type, operand_type));
+		wbAddr ra = wb_value_to_addr(p, r);
+		u32 rlo, rhi, blo, bhi;
+		wb_load_int128(p, r, &rlo, &rhi);
+		wb_load_int128(p, right, &blo, &bhi);
+		wb_local_get(p, rlo); wb_local_get(p, rhi); wb_op(p, wbOp_i64_or); wb_i64_const(p, 0); wb_op(p, wbOp_i64_ne);
+		wb_local_get(p, rhi); wb_local_get(p, bhi); wb_op(p, wbOp_i64_xor); wb_i64_const(p, 0); wb_op(p, wbOp_i64_lt_s);
+		wb_op(p, wbOp_i32_and);
+		wb_open_if(p);
+		wb_addr_store(p, ra, wb_emit_arith128(p, node, Token_Add, r, right, operand_type, operand_type));
+		wb_close(p);
+		return wb_emit_conv(p, r, result_type);
 	}
 
 	u32 alo, ahi;
@@ -2967,7 +2987,10 @@ gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbVal
 	}
 
 	case Token_ModMod: {
-		// Floored modulo: ((a % b) + b) % b
+		// Floored modulo: the remainder takes the sign of the divisor. Not
+		// `((a % b) + b) % b`, whose `+ b` overflows (1 %% max(i32) came out
+		// as -1); the remainder is corrected by b only when its sign differs
+		// from b's, and then |r| < |b| keeps r + b in range.
 		if (vt == wbValType_f32 || vt == wbValType_f64) {
 			wb_unsupported(p, node, "floating point '%%'");
 			return wb_value_invalid();
@@ -2975,11 +2998,21 @@ gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbVal
 		if (!is_signed) {
 			return wb_emit_arith(p, node, Token_Mod, left, right, operand_type, result_type);
 		}
-		wbOp rem = vt == wbValType_i64 ? wbOp_i64_rem_s : wbOp_i32_rem_s;
-		wbOp add = vt == wbValType_i64 ? wbOp_i64_add   : wbOp_i32_add;
-		wb_push(p, left); wb_push(p, right); wb_op(p, rem);
-		wb_push(p, right); wb_op(p, add);
-		wb_push(p, right); wb_op(p, rem);
+		bool is_64 = vt == wbValType_i64;
+		wbValue b = wb_value_to_local(p, right);
+		wb_push(p, left); wb_push(p, b); wb_op(p, is_64 ? wbOp_i64_rem_s : wbOp_i32_rem_s);
+		wbValue r = wb_pop_to_local(p, vt, operand_type);
+		// r + (r != 0 && (r ^ b) < 0 ? b : 0)
+		wb_push(p, r);
+		wb_push(p, b);
+		if (is_64) wb_i64_const(p, 0); else wb_i32_const(p, 0);
+		wb_push(p, r);
+		if (is_64) { wb_i64_const(p, 0); wb_op(p, wbOp_i64_ne); } else { wb_i32_const(p, 0); wb_op(p, wbOp_i32_ne); }
+		wb_push(p, r); wb_push(p, b); wb_op(p, is_64 ? wbOp_i64_xor : wbOp_i32_xor);
+		if (is_64) { wb_i64_const(p, 0); wb_op(p, wbOp_i64_lt_s); } else { wb_i32_const(p, 0); wb_op(p, wbOp_i32_lt_s); }
+		wb_op(p, wbOp_i32_and);
+		wb_op(p, wbOp_select);
+		wb_op(p, is_64 ? wbOp_i64_add : wbOp_i32_add);
 		wb_emit_normalize(p, result_type);
 		return wb_pop_to_local(p, rvt, result_type);
 	}
@@ -3554,7 +3587,15 @@ gb_internal wbValue wb_build_param_value(wbProcedure *p, Ast *call, Type *param_
 		if (type == nullptr || is_type_untyped(type)) {
 			type = param_type;
 		}
-		return wb_emit_conv(p, wb_const(p, call, type, pv.value), param_type);
+		ExactValue value = pv.value;
+		if (pv.original_ast_expr != nullptr && is_type_union(base_type(param_type))) {
+			// `a: A = B(int(4))`: the value arrives with the parameter's union
+			// as its variant; the expression says what it really is, and the
+			// constant writer peels it (see wb_union_const_real_variant)
+			value = exact_value_variant(pv.original_ast_expr);
+			type = param_type;
+		}
+		return wb_emit_conv(p, wb_const(p, call, type, value), param_type);
 	}
 	case ParameterValue_Nil: {
 		ExactValue nil_value = {};
@@ -4838,6 +4879,42 @@ gb_internal wbValue wb_build_call_expr(wbProcedure *p, Ast *expr) {
 	return res;
 }
 
+// The directives the checker leaves to the backend. `#load`, `#config`,
+// `#exists` and the rest are constants by the time the backend sees them;
+// `#location()` and `#location(x)` are not, because they name a procedure.
+gb_internal wbValue wb_build_builtin_directive(wbProcedure *p, Ast *expr) {
+	ast_node(ce, CallExpr, expr);
+	ast_node(bd, BasicDirective, ce->proc);
+	String name = bd->name.string;
+	if (name == "location") {
+		// A global initializer runs in no procedure, and says so with an
+		// empty name, as the LLVM backend does
+		String procedure = {};
+		bool in_startup = p == p->module->startup || p == p->module->startup_runtime;
+		if (p->entity != nullptr && !in_startup) {
+			procedure = p->entity->token.string;
+		}
+		TokenPos pos = ast_token(ce->proc).pos;
+		if (ce->args.count > 0) {
+			// #location(x): where x was declared, in the procedure that declared it
+			Ast *ident = unselector_expr(ce->args[0]);
+			GB_ASSERT(ident->kind == Ast_Ident);
+			Entity *e = entity_of_node(ident);
+			GB_ASSERT(e != nullptr);
+			DeclInfo *parent_proc_decl = e->parent_proc_decl.load(std::memory_order_relaxed);
+			if (parent_proc_decl != nullptr && parent_proc_decl->entity != nullptr) {
+				procedure = parent_proc_decl->entity.load()->token.string;
+			} else {
+				procedure = str_lit("");
+			}
+			pos = e->token.pos;
+		}
+		return wb_source_code_location(p, procedure, pos);
+	}
+	wb_unsupported(p, expr, "builtin directive");
+	return wb_value_invalid();
+}
+
 gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 	ast_node(ce, CallExpr, expr);
 	TypeAndValue proc_tv = type_and_value_of_expr(ce->proc);
@@ -4851,6 +4928,9 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 	if (proc_tv.mode == Addressing_Builtin) {
 		Entity *e = entity_of_node(ce->proc);
 		if (e == nullptr || e->kind != Entity_Builtin) {
+			if (ce->proc->kind == Ast_BasicDirective) {
+				return wb_build_builtin_directive(p, expr);
+			}
 			wb_unsupported(p, expr, "builtin procedure call");
 			return wb_value_invalid();
 		}
@@ -5589,6 +5669,18 @@ gb_internal wbValue wb_build_expr_internal(wbProcedure *p, Ast *expr) {
 		TypeAndValue cond_tv = type_and_value_of_expr(te->cond);
 		GB_ASSERT(cond_tv.value.kind == ExactValue_Bool);
 		return wb_emit_conv(p, wb_build_expr(p, cond_tv.value.value_bool ? te->x : te->y), tv.type);
+	case_end;
+
+	case_ast_node(bd, BasicDirective, expr);
+		// `#branch_location`, inside a `defer`: where the return or break that
+		// is running the deferred statement stands. Deferred statements are
+		// emitted at each exit, so it is known while they are (see
+		// wb_emit_defers_down_to and branch_location_pos); the other
+		// directives are constants by the time the backend sees them
+		if (bd->name.string == "branch_location") {
+			String proc_name = p->entity != nullptr ? p->entity->token.string : p->name;
+			return wb_source_code_location(p, proc_name, p->branch_location_pos);
+		}
 	case_end;
 	}
 

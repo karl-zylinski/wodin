@@ -469,6 +469,7 @@ struct wbProcedure {
 	wbProcGen  gen;
 	Type *     gen_type;    // the type a hasher/equal procedure is generated for
 	Ast *      curr_stmt;   // statement being lowered (for #caller_location of implicit runtime calls)
+	TokenPos   branch_location_pos; // the return or break whose defers are being emitted (#branch_location)
 	u16        state_flags; // #no_bounds_check / #no_type_assert etc. of the enclosing statements
 	String     import_module;
 	String     import_name;
