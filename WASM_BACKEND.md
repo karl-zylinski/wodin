@@ -61,8 +61,8 @@ outputs in `tests/wasm_backend/out/` (ignored by git):
 
 | Command | What it checks | Takes | Expected |
 |---|---|---|---|
-| `tests/wasm_backend/run.sh` | The differential harness: each `phase*` package built with both backends, run under wasmtime, outputs compared. New backend features get a test here | ~3 min | `160/160 passed` |
-| `tests/wasm_backend/upstream_tests.sh [paths]` | Odin's own tests (`tests/internal` by default, `tests/core/*/` on request) through both backends, verdicts compared. **This is the first thing to run on anything upstream added or changed** | seconds per file | every line `same` |
+| `tests/wasm_backend/run.sh` | The differential harness: each `phase*` package built with both backends, run under wasmtime, outputs compared. New backend features get a test here | ~3 min | `164/164 passed` (September 2026; the number grows with the tests) |
+| `tests/wasm_backend/upstream_tests.sh [paths]` | Odin's own tests (`tests/internal` by default; `tests/core/*/` and `tests/issues/*.odin` on request) through both backends, verdicts or output compared. **This is the first thing to run on anything upstream added or changed** | seconds per file | every line `same`, except `test_simd.odin` and `test_union_const.odin`, where the LLVM *reference* itself fails to build for wasm32 (an LLVM legalisation error, and an assertion in `lb_emit_call`) while the backend passes them |
 | `tests/wasm_backend/sweep.sh` | Every core and vendor package lowered whole with `-wasm-lower-all` | ~10 min | `ok=221 fail=1 skipped=107` -- the failure is `vendor/box3d`, whose `box3d_wasm.o` lacks `b3InternalAssert` |
 | `tests/wasm_backend/bench/run.sh` | Twelve benchmarks, LLVM `-o:speed` against the backend | ~1 min | see the table below |
 | `./build_odin_wasi.sh release` | The compiler still builds without LLVM and for WASI (the merge may have added something `ODIN_NO_LLVM` has to exclude) | ~2 min | `odin.wasm` around 3.7 MB |
@@ -104,10 +104,12 @@ the checkout this was written in has them the other way round, upstream as
 3. **Run the harness** (`tests/wasm_backend/run.sh`) and **the upstream tests
    that changed**:
 
-       tests/wasm_backend/upstream_tests.sh $(git diff --name-only ORIG_HEAD master -- tests/internal)
+       tests/wasm_backend/upstream_tests.sh $(git diff --name-only ORIG_HEAD master -- tests/internal tests/issues | grep '\.odin$')
 
    or all of `tests/internal` -- it is quick. `DIFFER` means the backend does
    not do what LLVM does for something upstream cared enough about to test.
+   A `DIFFER` where the *reference* is the one that failed to build or run is
+   an upstream problem for wasm32 (LLVM has them too); note it, move on.
 
 4. **Read the compiler and runtime changes with the backend in mind.** The
    backend does not link against anything; it *mirrors* things, and every
@@ -163,3 +165,31 @@ For the record, and as a sense of what to expect:
   `f32be`/`f64be` variable ran on the byte-swapped local. Fixed in
   `wasm_backend_expr.cpp`, covered in `phase3_endian`. This is the pattern:
   the upstream test is worth more than the upstream diff.
+- 40 commits, mostly `vendor` and a NEON port: two things, both found by
+  running the upstream tests that changed. The checker started folding a
+  compound literal of a bit_field type into a constant (`test_bit_field.odin`
+  line 138), which reached `wb_const`/`wb_write_const_data` as an
+  `ExactValue_Compound` of a type they had no case for; and the fix for
+  `#location` in a global initializer (`tests/issues/test_issue_7564.odin`)
+  turned out to be unsupported in the backend in *any* position, since the
+  harness only ever used it through `#caller_location` defaults. Both in
+  `wasm_backend.cpp`/`_expr.cpp`, covered by `phase2_structs_bitfield` and
+  `phase4_location`. Also from that merge: `odin test` of a `main`-style
+  program says "0 tests" under both backends, which is why `upstream_tests.sh`
+  uses `odin run` for files without `@(test)`. And the LLVM reference itself
+  aborted on the new `test_simd.odin` for wasm32 ("Do not know how to split
+  the result of this operator"), an upstream LLVM problem; the backend passed
+  all 14.
+- The same merge, once `upstream_tests.sh` existed and *all* of `tests/internal`
+  was run for the first time: four gaps that predate every merge and that the
+  harness had never asked about. `%%` was `((a % b) + b) % b`, whose sum
+  overflows (`1 %% max(i32)` gave -1; `test_modmod.odin`, 8 of 13 tests);
+  a global or `@(static)` `any` given a constant got the constant's bytes
+  instead of a pointer and a typeid, because the serialisability check's
+  "16 bytes is an i128" clause also fits `any` (`test_global_any.odin`);
+  `#branch_location` was not implemented (`test_branch_location.odin`); and a
+  constant whose variant is a variant of a variant (`Outer(Inner(x))`,
+  `Maybe(UI)` given an int) panicked in `union_variant_index_checked`
+  (`test_union_const.odin`). Covered by `phase4_modmod`, `phase4_any_globals`,
+  `phase4_location` and `phase4_union_const`. The lesson is the same one:
+  upstream's tests find what the harness does not think to ask.
