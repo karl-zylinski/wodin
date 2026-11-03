@@ -381,7 +381,7 @@ gb_internal void wb_build_value_decl(wbProcedure *p, AstValueDecl *vd, Ast *node
 		Ast *value = unparen_expr(vd->values[0]);
 		Entity *e = entity_of_node(vd->names[0]);
 		if (value->kind == Ast_CompoundLit && e != nullptr && !wb_is_scalar(e->type) &&
-		    value->tav.value.kind == ExactValue_Invalid && are_types_identical(type_of_expr(value), e->type)) {
+		    value->tav.value().kind == ExactValue_Invalid && are_types_identical(type_of_expr(value), e->type)) {
 			wbAddr addr = wb_add_variable(p, e);
 			if (addr.kind == wbAddr_Memory) {
 				wb_build_compound_lit(p, value, addr);
@@ -422,6 +422,8 @@ gb_internal void wb_build_value_decl(wbProcedure *p, AstValueDecl *vd, Ast *node
 		} else if (!(has_uninit && vd->values.count == vd->names.count && unparen_expr(vd->values[i])->kind == Ast_Uninit)) {
 			// Zero initialize (the declaration may be re-executed inside a loop)
 			wb_addr_zero(p, addr);
+		} else if (is_type_struct(e->type) && type_size_of_struct_pretend_is_packed(e->type) != type_size_of(e->type)) {
+			wb_addr_zero(p, addr);
 		}
 	}
 }
@@ -452,7 +454,7 @@ gb_internal void wb_build_block_stmt(wbProcedure *p, AstBlockStmt *bs, Ast *node
 // lowered to branches rather than to a value)
 gb_internal bool wb_cond_is_compound(Ast *cond) {
 	cond = unparen_expr(cond);
-	if (cond->tav.value.kind != ExactValue_Invalid) {
+	if (cond->tav.value().kind != ExactValue_Invalid) {
 		return false;
 	}
 	if (cond->kind == Ast_BinaryExpr) {
@@ -469,7 +471,7 @@ gb_internal bool wb_cond_is_compound(Ast *cond) {
 // straight to the target, rather than a value computed by short-circuiting
 gb_internal void wb_build_cond_br(wbProcedure *p, Ast *cond, bool jump_if, u32 target) {
 	cond = unparen_expr(cond);
-	if (cond->tav.value.kind == ExactValue_Invalid) {
+	if (cond->tav.value().kind == ExactValue_Invalid) {
 		if (cond->kind == Ast_BinaryExpr && (cond->BinaryExpr.op.kind == Token_CmpAnd || cond->BinaryExpr.op.kind == Token_CmpOr)) {
 			bool is_and = cond->BinaryExpr.op.kind == Token_CmpAnd;
 			if (is_and != jump_if) {
@@ -808,7 +810,7 @@ gb_internal bool wb_bce_same_path(Ast *a, Ast *b) {
 		       wb_bce_same_path(a->SelectorExpr.expr, b->SelectorExpr.expr);
 	case Ast_BasicLit:
 		return a->tav.mode == Addressing_Constant && b->tav.mode == Addressing_Constant &&
-		       compare_exact_values(Token_CmpEq, a->tav.value, b->tav.value);
+		       compare_exact_values(Token_CmpEq, a->tav.value(), b->tav.value());
 	case Ast_BinaryExpr:
 		return a->BinaryExpr.op.kind == b->BinaryExpr.op.kind &&
 		       wb_bce_same_path(a->BinaryExpr.left,  b->BinaryExpr.left) &&
@@ -825,7 +827,7 @@ gb_internal bool wb_bce_body_writes(Ast *body, Entity *root);
 gb_internal bool wb_bce_invariant(wbProcedure *p, Ast *body, Ast *expr, Entity *iv) {
 	expr = unparen_expr(expr);
 	if (expr->tav.mode == Addressing_Constant) {
-		return expr->tav.value.kind == ExactValue_Integer;
+		return expr->tav.value().kind == ExactValue_Integer;
 	}
 	switch (expr->kind) {
 	case Ast_Ident: {
@@ -978,7 +980,7 @@ gb_internal bool wb_bce_analyze(wbProcedure *p, AstRangeStmt *rs, AstBinaryExpr 
 	Ast *hi = unparen_expr(be->right);
 	bce->test_lo = false;
 	if (lo->tav.mode == Addressing_Constant) {
-		if (lo->tav.value.kind != ExactValue_Integer || big_int_is_neg(&lo->tav.value.value_integer)) {
+		if (lo->tav.value().kind != ExactValue_Integer || big_int_is_neg(&lo->tav.value().value_integer)) {
 			return false;
 		}
 	} else if (!is_type_integer(type_of_expr(lo))) {
@@ -988,7 +990,7 @@ gb_internal bool wb_bce_analyze(wbProcedure *p, AstRangeStmt *rs, AstBinaryExpr 
 	}
 	Ast *hi_len_path = wb_bce_len_operand(hi);
 	if (hi->tav.mode == Addressing_Constant) {
-		if (hi->tav.value.kind != ExactValue_Integer) {
+		if (hi->tav.value().kind != ExactValue_Integer) {
 			return false;
 		}
 	} else {
@@ -1087,7 +1089,7 @@ gb_internal bool wb_bce_analyze(wbProcedure *p, AstRangeStmt *rs, AstBinaryExpr 
 				proven = true;
 			} else if (hi->tav.mode == Addressing_Constant && bt->kind == Type_Array) {
 				i64 count = bt->Array.count;
-				i64 h = exact_value_to_i64(hi->tav.value);
+				i64 h = exact_value_to_i64(hi->tav.value());
 				proven = inclusive ? h < count : h <= count;
 			}
 			if (!proven && !may_version) {
@@ -1282,7 +1284,7 @@ gb_internal void wb_build_range_indexed(wbProcedure *p, AstRangeStmt *rs, Ast *n
 		base = wb_addr_from_pointer(p, ptr, pointee);
 		bt = base_type(pointee);
 	} else if (val0_ref) {
-		base = wb_build_addr(p, range_expr);
+		base = wb_addr_resolve_map_or_zero(p, wb_build_addr(p, range_expr));
 	} else {
 		wbValue v = wb_build_expr(p, range_expr);
 		if (v.kind == wbValue_Invalid) return;
@@ -1803,8 +1805,8 @@ gb_internal void wb_build_unroll_range_stmt(wbProcedure *p, AstUnrollRangeStmt *
 		ast_node(be, BinaryExpr, expr);
 		TokenKind op = be->op.kind == Token_RangeHalf ? Token_Lt : Token_LtEq;
 		ExactValue index = exact_value_i64(0);
-		for (ExactValue value = be->left->tav.value;
-		     compare_exact_values(op, value, be->right->tav.value);
+		for (ExactValue value = be->left->tav.value();
+		     compare_exact_values(op, value, be->right->tav.value());
 		     value = exact_value_increment_one(value), index = exact_value_increment_one(index)) {
 			emit_body(const_val(val0_type, value), const_val(val1_type, index));
 		}
@@ -1832,7 +1834,7 @@ gb_internal void wb_build_unroll_range_stmt(wbProcedure *p, AstUnrollRangeStmt *
 		//   i := 0
 		//   for ; i+N <= len(x); i += N { body }
 		//   for ; i < len(x);   i += 1 { body }
-		i64 unroll_count = exact_value_to_i64(rs->args[0]->tav.value);
+		i64 unroll_count = exact_value_to_i64(rs->args[0]->tav.value());
 
 		u32 data_local = 0;
 		i32 data_offset = 0;

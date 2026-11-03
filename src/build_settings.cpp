@@ -20,7 +20,7 @@ enum TargetOsKind : u16 {
 	TargetOs_freebsd,
 	TargetOs_openbsd,
 	TargetOs_netbsd,
-	
+
 	TargetOs_wasi,
 	TargetOs_js,
 	TargetOs_orca,
@@ -176,7 +176,7 @@ enum Subtarget : u32 {
 	Subtarget_iPhoneSimulator,
 	Subtarget_Android,
 	Subtarget_Playdate,
-	
+
 	Subtarget_COUNT,
 	Subtarget_Invalid,    // NOTE(harold): Must appear after _COUNT as this is not a real subtarget
 };
@@ -232,7 +232,7 @@ enum CommandKind : u64 {
 	Command_doc             = 1<<3,
 	Command_version         = 1<<4,
 	Command_test            = 1<<5,
-	
+
 	Command_strip_semicolon = 1<<6,
 	Command_bug_report      = 1<<7,
 
@@ -333,13 +333,34 @@ enum VetFlags : u64 {
 	VetFlag_Tabs            = 1u<<9,
 	VetFlag_UnusedProcedures = 1u<<10,
 	VetFlag_ExplicitAllocators = 1u<<11,
+	VetFlag_WhenShadowing   = 1u<<12,
+	VetFlag_NilDeref        = 1u<<13,
+	VetFlag_Uninitialized   = 1u<<14,
+	VetFlag_AtomicAccess    = 1u<<15,
 
 	VetFlag_Unused = VetFlag_UnusedVariables|VetFlag_UnusedImports,
 
-	VetFlag_All = VetFlag_Unused|VetFlag_Shadowing|VetFlag_UsingStmt|VetFlag_Deprecated|VetFlag_Cast,
+	VetFlag_All = VetFlag_Unused|VetFlag_Shadowing|VetFlag_UsingStmt|VetFlag_Deprecated|VetFlag_Cast|VetFlag_WhenShadowing,
 
 	VetFlag_Using = VetFlag_UsingStmt|VetFlag_UsingParam,
 };
+
+enum AnalysisFlags : u64 {
+	AnalysisFlag_NONE   = 0,
+	AnalysisFlag_Escape = 1u<<0,
+	AnalysisFlag_Atomic = 1u<<1,
+
+	AnalysisFlag_All = AnalysisFlag_Escape|AnalysisFlag_Atomic,
+};
+
+u64 get_analysis_flag_from_name(String const &name) {
+	if (name == "escape") {
+		return AnalysisFlag_Escape;
+	} else if (name == "atomic") {
+		return AnalysisFlag_Atomic;
+	}
+	return AnalysisFlag_NONE;
+}
 
 u64 get_vet_flag_from_name(String const &name) {
 	if (name == "unused") {
@@ -368,6 +389,14 @@ u64 get_vet_flag_from_name(String const &name) {
 		return VetFlag_UnusedProcedures;
 	} else if (name == "explicit-allocators") {
 		return VetFlag_ExplicitAllocators;
+	} else if (name == "when-shadowing") {
+		return VetFlag_WhenShadowing;
+	} else if (name == "nil-deref") {
+		return VetFlag_NilDeref;
+	} else if (name == "uninitialized") {
+		return VetFlag_Uninitialized;
+	} else if (name == "atomic-access") {
+		return VetFlag_AtomicAccess;
 	}
 	return VetFlag_NONE;
 }
@@ -451,12 +480,21 @@ enum LTOKind : i32 {
 
 enum LinkerChoice : i32 {
 	Linker_Invalid = -1,
-	Linker_Default = 0,
+	Linker_Default = 0, // radlink on Windows
 	Linker_lld,
+	Linker_msvc,
 	Linker_radlink,
 	Linker_mold,
 
 	Linker_COUNT,
+};
+
+String linker_choices[Linker_COUNT] = {
+	str_lit("default"),
+	str_lit("lld"),
+	str_lit("msvc"),
+	str_lit("radlink"),
+	str_lit("mold"),
 };
 
 enum SourceCodeLocationInfo : u8 {
@@ -464,13 +502,6 @@ enum SourceCodeLocationInfo : u8 {
 	SourceCodeLocationInfo_Obfuscated = 1,
 	SourceCodeLocationInfo_Filename = 2,
 	SourceCodeLocationInfo_None = 3,
-};
-
-String linker_choices[Linker_COUNT] = {
-	str_lit("default"),
-	str_lit("lld"),
-	str_lit("radlink"),
-	str_lit("mold"),
 };
 
 enum IntegerDivisionByZeroKind : u8 {
@@ -488,6 +519,12 @@ enum OptimizationLevel : i32 {
 	OptimizationLevel_Size       =  1,
 	OptimizationLevel_Speed      =  2,
 	OptimizationLevel_Aggressive =  3,
+};
+
+enum SemanticsFormat : u8 {
+	SemanticsFormat_Invalid,
+	SemanticsFormat_Json,
+	SemanticsFormat_Cbor,
 };
 
 // This stores the information for the specify architecture of this build
@@ -556,18 +593,27 @@ struct BuildContext {
 	bool   show_more_timings;
 	bool   show_defineables;
 	String export_defineables_file;
+	String overlay_file;
+	bool   workspace;
+
+	SemanticsFormat export_semantics_format;
+	String          export_semantics_file;
+	Array<String>   export_semantics_for; // specific files
+
 	bool   ignore_unused_defineables;
 	bool   show_system_calls;
 	bool   keep_temp_files;
 	bool   ignore_unknown_attributes;
 	bool   no_bounds_check;
 	bool   no_type_assert;
+	bool   lifetime_markers; // Opt-in to llvm.lifetime.* markers on scoped locals.
 	bool   dynamic_literals;  // Opt-in to `#+feature dynamic-literals` project-wide.
 	bool   no_output_files;
 	bool   no_crt;
 	bool   no_rpath;
 	bool   no_entry_point;
 	bool   wasm_lower_all;
+	u64    no_analysis_flags; // AnalysisFlags, by -no-<name>-analysis
 	bool   no_thread_local;
 	bool   cross_compiling;
 	bool   different_os;
@@ -615,6 +661,9 @@ struct BuildContext {
 	bool internal_weak_monomorphization;
 	bool internal_ignore_llvm_verification;
 	bool internal_llvm_no_sroa;
+	bool internal_global_entity_graph;
+	u64  internal_shuffle_global_entities; // seed, 0 = no shuffle
+	bool internal_check_global_edges;
 
 	bool   enable_rvo;
 
@@ -683,6 +732,8 @@ struct BuildContext {
 	String android_keystore;
 	String android_keystore_alias;
 	String android_keystore_password;
+
+	String windows_sdk_root;
 };
 
 gb_global BuildContext build_context = {0};
@@ -995,7 +1046,7 @@ gb_internal TargetOsKind get_target_os_from_string(String str, Subtarget *subtar
 
 			if (str_eq_ignore_case(subtarget, "generic") || str_eq_ignore_case(subtarget, "default")) {
 				*subtarget_ = Subtarget_Default;
-				
+
 			} else {
 				for (isize i = 1; i < Subtarget_COUNT; i++) {
 					if (str_eq_ignore_case(subtarget_strings[i], subtarget)) {
@@ -1420,24 +1471,18 @@ gb_internal String internal_odin_root_dir(void) {
 }
 #endif
 
-gb_global BlockingMutex fullpath_mutex;
-
 #if defined(GB_SYSTEM_WINDOWS)
+// `GetFullPathNameW` is only unsafe with threads while the current directory changes, which the compiler never does
 gb_internal String path_to_fullpath(gbAllocator a, String s, bool *ok_) {
 	String result = {};
 
 	String16 string16 = string_to_string16(heap_allocator(), s);
 	defer (gb_free(heap_allocator(), string16.text));
 
-	DWORD len;
-
-	mutex_lock(&fullpath_mutex);
-
-	len = GetFullPathNameW(cast(wchar_t *)&string16[0], 0, nullptr, nullptr);
+	DWORD len = GetFullPathNameW(cast(wchar_t *)&string16[0], 0, nullptr, nullptr);
 	if (len != 0) {
 		wchar_t *text = permanent_alloc_array<wchar_t>(len+1);
 		GetFullPathNameW(cast(wchar_t *)&string16[0], len, text, nullptr);
-		mutex_unlock(&fullpath_mutex);
 
 		text[len] = 0;
 		result = string16_to_string(a, make_string16(cast(u16 *)text, len));
@@ -1452,7 +1497,6 @@ gb_internal String path_to_fullpath(gbAllocator a, String s, bool *ok_) {
 		if (ok_) *ok_ = true;
 	} else {
 		if (ok_) *ok_ = false;
-		mutex_unlock(&fullpath_mutex);
 	}
 
 	return result;
@@ -1611,8 +1655,14 @@ gb_internal void init_android_values(bool with_sdk) {
 
 		i64 new_level = big_int_to_i64(&level);
 
-		if (new_level >= 21) {
+		if (new_level >= 29) {
 			bc->ODIN_ANDROID_API_LEVEL = cast(int)new_level;
+		} else if (new_level >= 21) {
+			// NOTE(bill): Android's runtime uses `@(thread_local)`
+			// LLVM-C cannot select emulated TLS, and Android only loads ELF TLS from API level 29 (Android 10).
+			gb_printf_err("Error: -subtarget:android requires -minimum-os-version:29 or higher, got %.*s\n", LIT(bc->minimum_os_version_string));
+			gb_printf_err("\tOdin uses ELF thread-local storage, which Android supports from API level 29\n");
+			gb_exit(1);
 		} else {
 			gb_printf_err("Warning: Invalid -minimum-os-version:%.*s for -subtarget:Android, defaulting to %.*s\n", LIT(bc->minimum_os_version_string), LIT(default_level));
 			bc->ODIN_ANDROID_API_LEVEL = atoi(cast(char const *)default_level.text);
@@ -1631,31 +1681,29 @@ gb_internal void init_android_values(bool with_sdk) {
 	#endif
 
 	if (bc->ODIN_ANDROID_NDK.len != 0 && bc->ODIN_ANDROID_NDK_TOOLCHAIN.len == 0) {
-		String arch = str_lit("x86_64");
-		#if defined (GB_CPU_ARM)
-			// TODO(bill): this is a complete guess
-			arch = str_lit("aarch64");
-		#endif
+		// NOTE(bill): The NDK's host tools are always in a directory named for x86_64. On macOS they are
+		// universal binaries that run on Apple Silicon too.
+		String host = {};
 		#if defined(GB_SYSTEM_WINDOWS)
-			bc->ODIN_ANDROID_NDK_TOOLCHAIN = concatenate4_strings(temporary_allocator(), bc->ODIN_ANDROID_NDK, str_lit("toolchains/llvm/prebuilt/"), str_lit("windows-"), arch);
+			host = str_lit("windows-x86_64");
 		#elif defined(GB_SYSTEM_OSX)
-			// TODO(bill): is this name even correct?
-			bc->ODIN_ANDROID_NDK_TOOLCHAIN = concatenate4_strings(temporary_allocator(), bc->ODIN_ANDROID_NDK, str_lit("toolchains/llvm/prebuilt/"), str_lit("darwin-"), arch);
+			host = str_lit("darwin-x86_64");
 		#elif defined(GB_SYSTEM_LINUX)
-			bc->ODIN_ANDROID_NDK_TOOLCHAIN = concatenate4_strings(temporary_allocator(), bc->ODIN_ANDROID_NDK, str_lit("toolchains/llvm/prebuilt/"), str_lit("linux-"), arch);
+			host = str_lit("linux-x86_64");
 		#endif
+		bc->ODIN_ANDROID_NDK_TOOLCHAIN = concatenate3_strings(temporary_allocator(), bc->ODIN_ANDROID_NDK, str_lit("toolchains/llvm/prebuilt/"), host);
 
 		bc->ODIN_ANDROID_NDK_TOOLCHAIN = normalize_path(permanent_allocator(), bc->ODIN_ANDROID_NDK_TOOLCHAIN, NIX_SEPARATOR_STRING);
 	}
 
 	if (bc->ODIN_ANDROID_NDK.len == 0 && !with_sdk)  {
-		gb_printf_err("Error: ODIN_ANDROID_NDK not set");
+		gb_printf_err("Error: ODIN_ANDROID_NDK not set\n");
 		gb_exit(1);
 
 	}
 
 	if (bc->ODIN_ANDROID_NDK_TOOLCHAIN.len == 0 && !with_sdk)  {
-		gb_printf_err("Error: ODIN_ANDROID_NDK not set");
+		gb_printf_err("Error: ODIN_ANDROID_NDK not set\n");
 		gb_exit(1);
 	}
 
@@ -1684,10 +1732,6 @@ gb_internal void init_android_values(bool with_sdk) {
 	if (with_sdk) {
 		if (bc->ODIN_ANDROID_SDK.len == 0)  {
 			gb_printf_err("Error: ODIN_ANDROID_SDK not set, which is required for -build-mode:executable for -subtarget:android");
-			gb_exit(1);
-		}
-		if (bc->android_keystore.len == 0) {
-			gb_printf_err("Error: -android-keystore:<string> has not been set\n");
 			gb_exit(1);
 		}
 	}
@@ -1746,7 +1790,7 @@ gb_internal String normalize_minimum_os_version_string(String version) {
 
 gb_internal void init_build_context_error_pos_style() {
 	build_context.ODIN_ERROR_POS_STYLE = ErrorPosStyle_Default;
-	
+
 	char const *found = gb_get_env("ODIN_ERROR_POS_STYLE", permanent_allocator());
 	if (found) {
 		ErrorPosStyle kind = ErrorPosStyle_Default;
@@ -1957,21 +2001,24 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 			bc->reloc_mode = RelocMode_PIC;
 		}
 	} else if (metrics->os == TargetOs_linux && subtarget == Subtarget_Android) {
+		// NOTE(bill): LLVM-C does not normalize triples, so they need the vendor. Read as `i686-linux-android`,
+		// "linux" is the vendor and LLVM does not know it is Android: i386 gets a 4-byte aligned stack
+		// and arm64 does not reserve x18, which Android's shadow call stack uses.
 		switch (metrics->arch) {
 		case TargetArch_arm64:
-			bc->metrics.target_triplet = str_lit("aarch64-linux-android");
+			bc->metrics.target_triplet = str_lit("aarch64-unknown-linux-android");
 			bc->reloc_mode = RelocMode_PIC;
 			break;
 		case TargetArch_arm32:
-			bc->metrics.target_triplet = str_lit("armv7a-linux-androideabi");
+			bc->metrics.target_triplet = str_lit("armv7a-unknown-linux-androideabi");
 			bc->reloc_mode = RelocMode_PIC;
 			break;
 		case TargetArch_amd64:
-			bc->metrics.target_triplet = str_lit("x86_64-linux-android");
+			bc->metrics.target_triplet = str_lit("x86_64-unknown-linux-android");
 			bc->reloc_mode = RelocMode_PIC;
 			break;
 		case TargetArch_i386:
-			bc->metrics.target_triplet = str_lit("i686-linux-android");
+			bc->metrics.target_triplet = str_lit("i686-unknown-linux-android");
 			bc->reloc_mode = RelocMode_PIC;
 			break;
 		default:
@@ -2243,15 +2290,15 @@ gb_internal bool check_target_feature_is_enabled(String const &feature, String *
 
 		String plus_str  = concatenate_strings(temporary_allocator(), make_string_c("+"), feature_str);
 		String minus_str = concatenate_strings(temporary_allocator(), make_string_c("-"), feature_str);
-		
+
 		bool has_raw   = string_set_exists(&build_context.target_features_set, feature_str);
 		bool has_plus  = string_set_exists(&build_context.target_features_set, plus_str);
 		bool has_minus = string_set_exists(&build_context.target_features_set, minus_str);
-		
+
 		// NOTE(jakubtomsu): this way "feature" and "+feature" is ALWAYS equivalent,
 		// and also allows the minus sign to do a final override.
 		bool is_enabled = (has_plus || has_raw) && !has_minus;
-		
+
 		if (want_enabled != is_enabled) {
 			if (not_enabled) *not_enabled = str;
 			return false;
@@ -2314,14 +2361,18 @@ gb_internal bool init_build_paths(String init_filename) {
 
 	string_set_init(&bc->target_features_set, 1024);
 
-	// [BuildPathMainPackage] Turn given init path into a `Path`, which includes normalizing it into a full path.
+	// Turn given init path into a `Path`, which includes normalizing it into a full path.
 	bc->build_paths[BuildPath_Main_Package] = path_from_string(ha, init_filename);
 
-	{
-		String build_project_name  = last_path_element(bc->build_paths[BuildPath_Main_Package].basename);
-		GB_ASSERT(build_project_name.len > 0);
-		bc->ODIN_BUILD_PROJECT_NAME = build_project_name;
+	Path   main_pkg           = bc->build_paths[BuildPath_Main_Package];
+	String build_project_name = last_path_element(bc->build_paths[BuildPath_Main_Package].basename);
+
+	if (build_project_name.len == 0) {
+		// Happens when building a package at root.
+		build_project_name = str_lit("/");
 	}
+
+	bc->ODIN_BUILD_PROJECT_NAME = build_project_name;
 
 	bool produces_output_file = false;
 	if (bc->command_kind == Command_doc && bc->cmd_doc_flags & CmdDocFlag_DocFormat) {
@@ -2346,6 +2397,16 @@ gb_internal bool init_build_paths(String init_filename) {
 			}
 		}
 
+		if (bc->metrics.arch == TargetArch_i386) {
+			if (build_context.linker_choice == Linker_radlink) {
+				gb_printf_err("radlink does not support Windows i386, use -linker:msvc or -linker:lld instead.\n");
+				return false;
+			}
+			if (build_context.linker_choice == Linker_Default) {
+				build_context.linker_choice = Linker_msvc;
+			}
+		}
+
 		if ((bc->command_kind & Command__does_build) && (!bc->ignore_microsoft_magic)) {
 			// NOTE(ic): It would be nice to extend this so that we could specify the Visual Studio version that we want instead of defaulting to the latest.
 			Find_Result find_result = find_visual_studio_and_windows_sdk();
@@ -2355,7 +2416,7 @@ gb_internal bool init_build_paths(String init_filename) {
 				return false;
 			}
 
-			if (build_context.linker_choice == Linker_Default && find_result.vs_exe_path.len == 0) {
+			if (build_context.linker_choice == Linker_msvc && find_result.vs_exe_path.len == 0) {
 				gb_printf_err("link.exe not found.\n");
 				return false;
 			}
@@ -2479,13 +2540,14 @@ gb_internal bool init_build_paths(String init_filename) {
 	} else {
 		Path output_path;
 
-		if (str_eq(init_filename, str_lit("."))) {
+		if (str_eq(init_filename, str_lit(".")) || str_eq(init_filename, str_lit("/"))) {
 			// We must name the output file after the current directory.
 			debugf("Output name will be created from current base name %.*s.\n", LIT(bc->build_paths[BuildPath_Main_Package].basename));
 			String last_element  = last_path_element(bc->build_paths[BuildPath_Main_Package].basename);
 
 			if (last_element.len == 0) {
-				gb_printf_err("The output name is created from the last path element. `%.*s` has none. Use `-out:output_name.ext` to set it.\n", LIT(bc->build_paths[BuildPath_Main_Package].basename));
+				String init_fullpath = path_to_full_path(ha, init_filename);
+				gb_printf_err("The output name is created from the last path element. `%.*s` has none. Use `-out:output_name.ext` to set it.\n", LIT(init_fullpath));
 				return false;
 			}
 			output_path.basename = copy_string(ha, bc->build_paths[BuildPath_Main_Package].basename);
@@ -2542,8 +2604,8 @@ gb_internal bool init_build_paths(String init_filename) {
 				output_path.name = copy_string(ha, output_path.name);
 				// The old basename is wrong. Delete it
 				gb_free(ha, old_basename.text);
-				
-				
+
+
 			}
 
 			// Replace extension.
@@ -2619,6 +2681,10 @@ gb_internal bool init_build_paths(String init_filename) {
 			break;
 		default:
 			gb_printf_err("-sanitize:address is only supported on Windows, Linux, Darwin, and FreeBSD\n");
+			return false;
+		}
+		if (build_context.metrics.os == TargetOs_windows && build_context.metrics.arch != TargetArch_amd64) {
+			gb_printf_err("-sanitize:address is only supported on Windows for amd64\n");
 			return false;
 		}
 	}

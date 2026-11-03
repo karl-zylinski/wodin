@@ -36,8 +36,10 @@ running wasm outputs through `wasmtime` for `odin run`/`odin test`, with
 (`Backend_Wasm`, `-wasm-lower-all`), `src/checker.cpp`, and what it took to
 build without LLVM and for WASI: `src/gb/gb.h`, `src/microarch.cpp`,
 `src/common_memory.cpp`, `src/threading.cpp`, `src/path.cpp`,
-`src/string_interner.cpp`, `src/bug_report.cpp`, `src/llvm_backend.cpp`
-(`ODIN_NO_LLVM`). In `core`: `core/testing/runner_single_threaded.odin` and
+`src/string_interner.cpp`, `src/bug_report.cpp`, `src/timings.cpp`,
+`src/llvm_backend.cpp` (`ODIN_NO_LLVM`), and one line of `src/parser.cpp`
+(`ast_node_size` measures the variant's offset in `Ast` instead of assuming
+it equals `sizeof(AstCommonStuff)`, which on wasm32 it does not). In `core`: `core/testing/runner_single_threaded.odin` and
 `core/terminal/terminal_other.odin`. To see the whole footprint:
 
     git diff --stat $(git merge-base master upstream/master) master
@@ -45,11 +47,13 @@ build without LLVM and for WASI: `src/gb/gb.h`, `src/microarch.cpp`,
 Build scripts, at the root next to `build_odin.sh`:
 
 - `build_odin_nollvm.sh` -- the compiler without LLVM; it can only generate code with `-backend:wasm`
-- `build_odin_wasi.sh [debug|release]` -- the compiler as a WASI module (`odin.wasm`) with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) (`WASI_SDK=~/wasi-sdk`, `OUT=odin.wasm`); this is what the playground runs in the browser, so its size matters (about 3.7 MB, 1.06 MB gzipped)
+- `build_odin_wasi.sh [debug|release]` -- the compiler as a WASI module (`odin.wasm`) with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) (`WASI_SDK=~/wasi-sdk`, `OUT=odin.wasm`); this is what the playground runs in the browser, so its size matters (about 4.5 MB, 1.30 MB gzipped; it was 3.7 MB before the November 2026 merge, which brought `checker_global.cpp`, `semantics_writer.cpp`, `big_rat.cpp`, `check_escape.cpp` and `check_atomics.cpp`)
 
 Flags: `-backend:wasm` selects the backend; `-wasm-lower-all` lowers every
-procedure of the packages being compiled, not only the reachable ones, which
-is what the sweep below uses to find unsupported constructs.
+procedure of the packages being compiled, not only the reachable ones (it
+also ignores `#+lazy`, and skips procedures whose bodies the checker never
+checked, such as failed polymorphic specialisations), which is what the sweep
+below uses to find unsupported constructs.
 
 ## Building and testing
 
@@ -61,18 +65,24 @@ outputs in `tests/wasm_backend/out/` (ignored by git):
 
 | Command | What it checks | Takes | Expected |
 |---|---|---|---|
-| `tests/wasm_backend/run.sh` | The differential harness: each `phase*` package built with both backends, run under wasmtime, outputs compared. New backend features get a test here | ~3 min | `164/164 passed` (September 2026; the number grows with the tests) |
-| `tests/wasm_backend/upstream_tests.sh [paths]` | Odin's own tests (`tests/internal` by default; `tests/core/*/` and `tests/issues/*.odin` on request) through both backends, verdicts or output compared. **This is the first thing to run on anything upstream added or changed** | seconds per file | every line `same`, except `test_simd.odin` and `test_union_const.odin`, where the LLVM *reference* itself fails to build for wasm32 (an LLVM legalisation error, and an assertion in `lb_emit_call`) while the backend passes them |
-| `tests/wasm_backend/sweep.sh` | Every core and vendor package lowered whole with `-wasm-lower-all` | ~10 min | `ok=221 fail=1 skipped=107` -- the failure is `vendor/box3d`, whose `box3d_wasm.o` lacks `b3InternalAssert` |
+| `tests/wasm_backend/run.sh` | The differential harness: each `phase*` package built with both backends, run under wasmtime, outputs compared. New backend features get a test here | ~4 min | `186/186 passed` (November 2026; the number grows with the tests) |
+| `tests/wasm_backend/upstream_tests.sh [paths]` | Odin's own tests (`tests/internal` by default; `tests/core/*/` and `tests/issues/*/` on request) through both backends, verdicts or output compared. **This is the first thing to run on anything upstream added or changed** | seconds per file | every line `same`, except where the LLVM *reference* itself fails for wasm32 while the backend passes: `test_simd.odin` (an LLVM legalisation error), `test_union_const.odin`, `test_union_const_nonconstantable.odin`, `test_packed_field.odin`, `tests/issues/test_issue_7817`, `test_issue_distinct_constraint` (an assertion in `lb_emit_call`), and `test_128.odin`, where the reference fails `test_128_align` and the backend passes both. In `tests/issues`, the four programs with a `.c` file fail under both for want of the C object |
+| `tests/wasm_backend/sweep.sh` | Every core and vendor package lowered whole with `-wasm-lower-all` | ~10 min | `ok=262 fail=1 skipped=107` -- the failure is `vendor/box3d`, whose `box3d_wasm.o` lacks `b3InternalAssert` |
 | `tests/wasm_backend/bench/run.sh` | Twelve benchmarks, LLVM `-o:speed` against the backend | ~1 min | see the table below |
-| `./build_odin_wasi.sh release` | The compiler still builds without LLVM and for WASI (the merge may have added something `ODIN_NO_LLVM` has to exclude) | ~2 min | `odin.wasm` around 3.7 MB |
-| karl2d.com: `playground/_source/test/run_all_examples.sh` | The 24 Karl2D examples compiled and run in a headless Firefox by the playground, on the new `odin.wasm` | ~8 min | `pass=24 fail=0` |
+| `./build_odin_wasi.sh release` | The compiler still builds without LLVM and for WASI (the merge may have added something `ODIN_NO_LLVM` has to exclude) | ~2 min | `odin.wasm` around 4.5 MB |
+| karl2d.com: `playground/_source/test/run_all_examples.sh` | The Karl2D examples compiled and run in a headless Firefox by the playground, on the new `odin.wasm`. **The only test of the WASI build itself**, which can break where the native compiler does not (32-bit pointers, no threads) | ~8 min | `pass=26 fail=0` |
 
-The benchmarks, in milliseconds under wasmtime, as of September 2026 (LLVM /
-backend): bunnies 32 / 32, entities 21 / 23, matrix 46 / 45, map 159 / 113,
-string_map 61 / 76, sort 1172 / 615, sort_struct 280 / 158, fib 10 / 15,
-fmt 81 / 104, dyn_array 14 / 17, pixels 25 / 24, particles_soa 63 / 52. A row
-that moves by a fifth or more after a change is a real change.
+The benchmarks, in milliseconds under wasmtime, as of November 2026 (LLVM /
+backend): bunnies 33 / 38, entities 23 / 24, matrix 48 / 47, map 112 / 114,
+string_map 67 / 81, sort 1256 / 715, sort_struct 304 / 181, fib 11 / 15,
+fmt 54 / 68, dyn_array 15 / 19, pixels 28 / 28, particles_soa 51 / 56. A row
+that moves by a fifth or more after a change is a real change. The November
+merge moved several rows (map and fmt got much faster, bunnies, sort and
+particles_soa slower on the backend side); that was upstream's `core`, not
+the backend: the new compiler on the pre-merge `core` (`ODIN_ROOT=` an
+export of the previous commit) reproduced the September numbers, and the
+generated code of `bench_bunnies` was identical apart from data addresses.
+That is the way to tell the two apart after a merge.
 
 ## Updating from upstream
 
@@ -123,7 +133,7 @@ the checkout this was written in has them the other way round, upstream as
    | `base/runtime/core.odin` -- `Type_Info*`, `Raw_*`, `Source_Code_Location`, `Context`, allocator modes | `wasm_backend_rtti.cpp`, the struct offsets in `wasm_backend.cpp`/`_expr.cpp` | The backend writes these structures into memory by hand, field by field |
    | `base/runtime/dynamic_map_internal.odin` | `wasm_backend_map.cpp` | Map layout, hashing, the procedures called by name (`map_insert_hash_dynamic`, `__dynamic_map_check_grow`, ...) |
    | `base/runtime/core_builtin_soa.odin`, `core_builtin.odin` | `wasm_backend_soa.cpp`, `wasm_backend_expr.cpp` | `#soa` layout, `append`/`reserve` (`__dynamic_array_append`, ...) |
-   | Anything renaming a runtime procedure | `grep -o 'wb_emit_runtime_call(p, "[a-z_0-9]*"' src/wasm_backend*.cpp` and `wb_lookup_runtime_procedure` | The backend calls about twenty runtime procedures by name: `bounds_check_error`, `default_hasher*`, `cstring_to_string`, `memory_equal`, `__type_info_of`, `extendhfsf2`/`truncsfhf2` for f16, ... A rename shows up as "runtime procedure not found" at the first program that needs it |
+   | Anything renaming a runtime procedure | `grep -o 'wb_emit_runtime_call(p, "[a-z_0-9]*"' src/wasm_backend*.cpp` and `wb_lookup_runtime_procedure` | The backend calls about twenty runtime procedures by name: `bounds_check_error_contextless`/`_with_context` (and the slice and matrix ones, chosen like `lb_emit_bounds_check` does), `default_hasher_fixed` (through `runtime_default_hasher_fixed_name`), `default_hasher_string*`, `cstring_to_string`, `memory_equal`, `__type_info_of`, `extendhfsf2`/`truncsfhf2`/`truncdfhf2` for f16, ... A rename shows up as "runtime procedure not found" at the first program that needs it |
    | `src/parser.hpp` -- `AST_KINDS`, a new node or field | `wasm_backend_stmt.cpp`, `wasm_backend_expr.cpp` | The backend switches on node kinds; a new kind that reaches it is an "unsupported statement/expression" |
    | `src/check_expr.cpp`, `src/check_stmt.cpp` -- new constant folding, new implicit conversions, new `ExactValue` kinds | `wb_const` in `wasm_backend.cpp` | Constants are emitted from `ExactValue`; a new kind or a new place a constant can appear (`#location` in a global initialiser, say) hits `wb_const`/`wb_write_const_data` |
    | `src/entity.cpp`, `src/checker.cpp` -- entity flags, `@(...)` attributes | `wasm_backend.cpp` procedure setup | Calling convention, `#force_inline`, `@(export)`, `@(link_name)`, `foreign` |
@@ -193,3 +203,47 @@ For the record, and as a sense of what to expect:
   (`test_union_const.odin`). Covered by `phase4_modmod`, `phase4_any_globals`,
   `phase4_location` and `phase4_union_const`. The lesson is the same one:
   upstream's tests find what the harness does not think to ask.
+- 1190 commits, September to November 2026 (the checker split into
+  `checker_global.cpp`, exact rationals for untyped float constants,
+  `@(align=N)` on variables, array-backed bit_sets, the address intrinsics,
+  C vararg tests, a rewrite of the map runtime, `vendor/darwin`): the first
+  merge with conflicts, four of them, all trivial (`-wasm-lower-all` next to
+  the new `-no-*-analysis` flags, the dependency-set worker in `checker.cpp`,
+  and the microarch procedures the fork had moved out of `llvm_backend.cpp`,
+  whose upstream i386 change went into `microarch.cpp`). The build then broke
+  three times: `tav.value` became an accessor, `ExactValue_Rational` and
+  complex/quaternion parts that are `ExactValue`s themselves (`wb_const`,
+  `wb_write_const_data` convert them with `exact_value_to_float`), and
+  `CLOCK_THREAD_CPUTIME_ID` in `timings.cpp` for WASI. Every program then
+  crashed: the bounds check procedures had become `*_contextless` /
+  `*_with_context` pairs. The harness caught `default_hasher_fixed` (the hash
+  of an int key differed). After that, two reviews of the upstream diff and
+  the upstream tests found twenty-odd things, each now a `phase4_*` package:
+  `min(T) / -1` wrapping, shift amounts wider than the shifted type (and in
+  `simd_shl`/`simd_shr` and 128-bit shifts), booleans compared by truth,
+  multi-value calls in compound literals, array conversion by depth and
+  constants broadcast into nested arrays and union variants, omitted fields
+  converted to a union, `@(align)` variables and frames aligned above 16,
+  padding of flattened parameters and `---` structs left unzeroed (why
+  `test_rvo_declaration` printed equal values that compared unequal), the
+  operators on `#simd` values, `[N]matrix op matrix`, the equality procedure
+  of `#simd` map keys calling itself, swizzles of swizzles, array-backed
+  bit_sets and `~x` as `mask &~ x`, `c_va_start`/`c_va_arg`/`c_va_end`
+  (the wasm32 convention: promoted arguments in a stack buffer, one trailing
+  pointer), `for x in m[key]`, compare-exchange of floats by bits, `using` an
+  `#soa` pointer, `variadic_index` of a deferred polymorphic procedure,
+  NaN payloads of float constants, f64 to f16 in one rounding, and
+  `frame_address`/`stack_pointer`. Fixing `upstream_tests.sh` to see a bare
+  `@test` exposed four older gaps (`overflow_*` on 128-bit integers, i128
+  matrices, imported procedure groups, constant slices with field values),
+  and the sweep two more: `-wasm-lower-all` picked up polymorphic
+  specialisations whose bodies were never checked (`check_min_dep_bodies_were_checked`
+  is new upstream), and the new `core:compress/deflate` slices and indexes
+  through `^[^]u8`. `odin.wasm` grew by a fifth. And the playground found
+  the one thing nothing native could: with `TypeAndValue` in the AST header
+  replaced by the smaller `AstTypeAndValue`, `sizeof(AstCommonStuff)` is 20
+  on wasm32 while the 8-aligned variant union starts at 24, so every AST
+  node was allocated 4 bytes short and the next node overwrote its tail
+  (a field list whose `count` was a pointer). Invisible on 64-bit, where
+  both are 32. Hence the `ast_node_size` line above, and why the playground
+  run is on the list.

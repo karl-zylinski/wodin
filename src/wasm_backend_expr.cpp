@@ -231,6 +231,7 @@ gb_internal wbValue wb_type_info(wbProcedure *p, Type *type);
 gb_internal bool wb_is_int128(Type *t);
 gb_internal wbAddr wb_addr_deep_field(wbProcedure *p, Ast *expr, wbAddr addr, Type *type, Selection const &sel);
 gb_internal wbValue wb_emit_arith128(wbProcedure *p, Ast *node, TokenKind op, wbValue left, wbValue right, Type *operand_type, Type *result_type);
+gb_internal wbValue wb_emit_arith_bit_set_wide(wbProcedure *p, Ast *node, TokenKind op, wbValue left, wbValue right, Type *operand_type, Type *result_type);
 gb_internal void wb_emit_branch(wbProcedure *p, TokenKind kind, Ast *label, Ast *node);
 
 gb_internal wbValue wb_typeid(Type *type) {
@@ -649,7 +650,7 @@ gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst) {
 		}
 	}
 
-	if (is_type_array_like(dst) && !is_type_array_like(src) && svt != wbValType_Invalid) {
+	if (is_type_array_like(dst) && !is_type_array_like(src) && svt != wbValType_Invalid && type_array_depth(dst) == 1) {
 		// scalar -> [N]T splat (array arithmetic with a scalar operand)
 		Type *bt = base_type(dst);
 		Type *elem = bt->kind == Type_Array ? bt->Array.elem : bt->EnumeratedArray.elem;
@@ -662,11 +663,22 @@ gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst) {
 		}
 		return wb_value_memory(tmp.index, tmp.offset, dst);
 	}
+	if (is_type_array_like(dst) && (is_type_array_like(src) ? type_array_depth(src) < type_array_depth(dst) : !is_type_matrix(src) && !is_type_simd_vector(src))) {
+		Type *elem = base_array_type(dst);
+		i64 count  = get_array_type_count(dst);
+		wbValue e = wb_value_fresh(p, wb_emit_conv(p, v, elem));
+		wbAddr tmp = wb_add_temp(p, dst);
+		i64 elem_size = type_size_of(elem);
+		for (i64 i = 0; i < count; i++) {
+			wb_addr_store(p, wb_addr_offset(tmp, i * elem_size, elem), e);
+		}
+		return wb_value_memory(tmp.index, tmp.offset, dst);
+	}
 	if (is_type_array(dst) && is_type_array(src)) {
 		// [N]A -> [N]B: element by element
 		Type *bs = base_type(src);
 		Type *bd = base_type(dst);
-		if (bs->Array.count == bd->Array.count && !are_types_identical(bs->Array.elem, bd->Array.elem)) {
+		if (bs->Array.count == bd->Array.count && type_array_depth(bs) == type_array_depth(bd) && !are_types_identical(bs->Array.elem, bd->Array.elem)) {
 			wbAddr sa = wb_value_to_addr(p, v);
 			wbAddr tmp = wb_add_temp(p, dst);
 			i64 ses = type_size_of(bs->Array.elem);
@@ -711,6 +723,14 @@ gb_internal wbValue wb_emit_conv(wbProcedure *p, wbValue v, Type *dst) {
 		return wb_emit_conv(p, f, dst);
 	}
 	if (wb_is_f16(dst) && !wb_is_f16(src)) {
+		if (is_type_float(core_type(src)) && type_size_of(src) == 8 && !is_type_different_to_arch_endianness(src)) {
+			auto args = array_make<wbValue>(temporary_allocator(), 1);
+			args[0] = v;
+			args[0].type = t_f64;
+			wbValue h = wb_emit_runtime_call(p, "truncdfhf2", args);
+			h.type = dst;
+			return h;
+		}
 		wbValue f = wb_emit_conv(p, v, t_f32);
 		if (f.kind == wbValue_Invalid) {
 			return f;
@@ -1071,7 +1091,15 @@ gb_internal wbAddr wb_addr_of_entity(wbProcedure *p, Entity *e, Ast *node) {
 			}
 			Selection sel = lookup_field(parent->type, entity_interned_name(e), false);
 			GB_ASSERT(sel.entity != nullptr);
-			wbAddr addr = wb_addr_deep_field(p, node, wb_addr_resolve_map(p, parent_addr), parent->type, sel);
+			wbAddr addr = {};
+			if (parent_addr.kind == wbAddr_SoaVariable) {
+				addr = wb_soa_field_addr(p, node, parent_addr, sel);
+			} else {
+				addr = wb_addr_deep_field(p, node, wb_addr_resolve_map(p, parent_addr), parent->type, sel);
+			}
+			if (addr.kind == wbAddr_Invalid) {
+				return addr;
+			}
 			addr.type = e->type;
 			return addr;
 		}
@@ -1218,6 +1246,17 @@ gb_internal wbAddr wb_build_addr_selector(wbProcedure *p, Ast *expr) {
 	if (addr.kind == wbAddr_Invalid) {
 		return invalid;
 	}
+	if (addr.kind == wbAddr_Swizzle && sel.index.count == 1) {
+		Type *elem = base_type(addr.type)->Array.elem;
+		u8 k = addr.swizzle_indices[sel.index[0]];
+		if (addr.soa_type != nullptr) {
+			addr = wb_soa_field_elem_addr(p, wb_soa_container(addr), wb_value_const_int(t_int, k), addr.soa_index);
+		} else {
+			addr = wb_addr_memory(addr.index, addr.offset + cast(i32)(k*type_size_of(elem)), elem);
+		}
+		addr.type = type_of_expr(expr);
+		return addr;
+	}
 	if (addr.kind == wbAddr_SoaVariable) {
 		// soa[i].x: one component of the element
 		addr = wb_soa_field_addr(p, expr, addr, sel);
@@ -1236,6 +1275,16 @@ gb_internal wbAddr wb_addr_deep_field(wbProcedure *p, Ast *expr, wbAddr addr, Ty
 	wbAddr invalid = {};
 	for_array(i, sel.index) {
 		i32 index = sel.index[i];
+		if (is_type_soa_pointer(type)) {
+			wbAddr soa = wb_addr_soa_variable_from_soa_ptr(p, wb_addr_load(p, addr));
+			if (soa.kind == wbAddr_Invalid) {
+				return invalid;
+			}
+			Selection sub_sel = sel;
+			sub_sel.index.data  += i;
+			sub_sel.index.count -= i;
+			return wb_soa_field_addr(p, expr, soa, sub_sel);
+		}
 		if (is_type_pointer(type)) {
 			// auto dereference
 			wbValue ptr = wb_addr_load(p, addr);
@@ -1337,6 +1386,18 @@ gb_internal void wb_set_file_line_col(wbProcedure *p, Array<wbValue> *args, Toke
 
 // `index` must be in 0..<len; the runtime call is guarded by an inline
 // unsigned comparison so that the common case is a couple of instructions
+gb_internal char const *wb_bounds_check_handler_name(wbProcedure *p, char const *contextless, char const *with_context, char const *old_name) {
+	char const *name = contextless;
+	if (wb_is_odin_cc(p->type) || p->context_stack.count > 0) {
+		name = with_context;
+	}
+	Scope *scope = p->module->info->runtime_package->scope;
+	if (scope_lookup_current(scope, string_interner_insert(make_string_c(name))) == nullptr) {
+		return old_name;
+	}
+	return name;
+}
+
 gb_internal void wb_emit_bounds_check(wbProcedure *p, Token token, wbValue index, wbValue len) {
 	if (wb_bounds_check_disabled(p)) {
 		return;
@@ -1363,7 +1424,7 @@ gb_internal void wb_emit_bounds_check(wbProcedure *p, Token token, wbValue index
 	wb_set_file_line_col(p, &args, token.pos);
 	array_add(&args, index);
 	array_add(&args, len);
-	wb_emit_runtime_call(p, "bounds_check_error", args);
+	wb_emit_runtime_call(p, wb_bounds_check_handler_name(p, "bounds_check_error_contextless", "bounds_check_error_with_context", "bounds_check_error"), args);
 	wb_close(p);
 }
 
@@ -1394,7 +1455,7 @@ gb_internal void wb_emit_slice_bounds_check(wbProcedure *p, Token token, wbValue
 		wb_set_file_line_col(p, &args, token.pos);
 		array_add(&args, high);
 		array_add(&args, len);
-		wb_emit_runtime_call(p, "slice_expr_error_hi", args);
+		wb_emit_runtime_call(p, wb_bounds_check_handler_name(p, "slice_expr_error_hi_contextless", "slice_expr_error_hi_with_context", "slice_expr_error_hi"), args);
 		wb_close(p);
 	} else {
 		if (low.kind == wbValue_Const && high.kind == wbValue_Const && len.kind == wbValue_Const &&
@@ -1420,7 +1481,7 @@ gb_internal void wb_emit_slice_bounds_check(wbProcedure *p, Token token, wbValue
 		array_add(&args, low);
 		array_add(&args, high);
 		array_add(&args, len);
-		wb_emit_runtime_call(p, "slice_expr_error_lo_hi", args);
+		wb_emit_runtime_call(p, wb_bounds_check_handler_name(p, "slice_expr_error_lo_hi_contextless", "slice_expr_error_lo_hi_with_context", "slice_expr_error_lo_hi"), args);
 		wb_close(p);
 	}
 }
@@ -1448,7 +1509,7 @@ gb_internal void wb_emit_multi_pointer_slice_bounds_check(wbProcedure *p, Token 
 	wb_set_file_line_col(p, &args, token.pos);
 	array_add(&args, low);
 	array_add(&args, high);
-	wb_emit_runtime_call(p, "multi_pointer_slice_expr_error", args);
+	wb_emit_runtime_call(p, wb_bounds_check_handler_name(p, "multi_pointer_slice_expr_error_contextless", "multi_pointer_slice_expr_error_with_context", "multi_pointer_slice_expr_error"), args);
 	wb_close(p);
 }
 
@@ -1500,7 +1561,7 @@ gb_internal wbAddr wb_build_addr_matrix_index(wbProcedure *p, Ast *expr) {
 		array_add(&args, col);
 		array_add(&args, wb_value_const_int(t_int, bt->Matrix.row_count));
 		array_add(&args, wb_value_const_int(t_int, bt->Matrix.column_count));
-		wb_emit_runtime_call(p, "matrix_bounds_check_error", args);
+		wb_emit_runtime_call(p, wb_bounds_check_handler_name(p, "matrix_bounds_check_error_contextless", "matrix_bounds_check_error_with_context", "matrix_bounds_check_error"), args);
 		wb_close(p);
 	}
 	// element index = minor + stride*major
@@ -1537,6 +1598,10 @@ gb_internal wbAddr wb_build_addr_index(wbProcedure *p, Ast *expr) {
 		wbValue ptr = wb_build_expr(p, ie->expr);
 		bt = base_type(type_deref(bt));
 		base = wb_addr_from_pointer(p, ptr, type_deref(base_t));
+		if (bt->kind == Type_MultiPointer) {
+			wbValue mp = wb_addr_load(p, base);
+			base = wb_addr_from_pointer(p, mp, bt->MultiPointer.elem);
+		}
 	} else if (bt->kind == Type_MultiPointer) {
 		wbValue ptr = wb_build_expr(p, ie->expr);
 		base = wb_addr_from_pointer(p, ptr, bt->MultiPointer.elem);
@@ -1711,6 +1776,48 @@ gb_internal wbAddr wb_build_addr_internal(wbProcedure *p, Ast *expr) {
 		return wb_addr_from_pointer(p, ptr, type);
 	case_end;
 
+	case_ast_node(ce, CallExpr, expr);
+		TypeAndValue tav = type_and_value_of_expr(expr);
+		isize index_count = ce->args.count-1;
+		if (ce->proc->tav.mode == Addressing_Builtin && is_type_array(tav.type) && index_count >= 1 && index_count <= 4) {
+			Entity *e = entity_of_node(ce->proc);
+			if (e != nullptr && e->kind == Entity_Builtin && cast(BuiltinProcId)e->Builtin.id == BuiltinProc_swizzle) {
+				u8 indices[4] = {};
+				for (isize i = 0; i < index_count; i++) {
+					indices[i] = cast(u8)exact_value_to_i64(ce->args[i+1]->tav.value());
+				}
+				wbAddr base = wb_build_addr(p, ce->args[0]);
+				if (base.kind == wbAddr_SoaVariable) {
+					return wb_soa_swizzle_addr(p, base, tav.type, cast(u8)index_count, indices);
+				}
+				if (base.kind == wbAddr_Swizzle) {
+					wbAddr composed = base;
+					composed.type = tav.type;
+					composed.swizzle_count = cast(u8)index_count;
+					for (isize i = 0; i < index_count; i++) {
+						composed.swizzle_indices[i] = base.swizzle_indices[indices[i]];
+					}
+					return composed;
+				}
+				if (base.kind != wbAddr_Memory) {
+					wbValue v = wb_addr_load(p, base);
+					if (v.kind != wbValue_Memory) {
+						return invalid;
+					}
+					base = wb_addr_memory(v.index, v.offset, v.type);
+				}
+				wbAddr addr = base;
+				addr.kind = wbAddr_Swizzle;
+				addr.type = tav.type;
+				addr.swizzle_count = cast(u8)index_count;
+				for (isize i = 0; i < index_count; i++) {
+					addr.swizzle_indices[i] = indices[i];
+				}
+				return addr;
+			}
+		}
+	case_end;
+
 	case_ast_node(cl, CompoundLit, expr);
 		Type *type = type_of_expr(expr);
 		TypeAndValue tav = type_and_value_of_expr(expr);
@@ -1756,8 +1863,8 @@ gb_internal void wb_build_compound_lit_array_elems(wbProcedure *p, Ast *expr, Sl
 			ast_node(fv, FieldValue, elem);
 			if (is_ast_range(fv->field)) {
 				ast_node(ie, BinaryExpr, fv->field);
-				i64 lo = exact_value_to_i64(ie->left->tav.value) - min_value;
-				i64 hi = exact_value_to_i64(ie->right->tav.value) - min_value;
+				i64 lo = exact_value_to_i64(ie->left->tav.value()) - min_value;
+				i64 hi = exact_value_to_i64(ie->right->tav.value()) - min_value;
 				if (ie->op.kind != Token_RangeHalf) {
 					hi += 1;
 				}
@@ -1768,14 +1875,22 @@ gb_internal void wb_build_compound_lit_array_elems(wbProcedure *p, Ast *expr, Sl
 				}
 				index = hi;
 			} else {
-				index = exact_value_to_i64(fv->field->tav.value) - min_value;
+				index = exact_value_to_i64(fv->field->tav.value()) - min_value;
 				wbValue v = wb_emit_conv(p, wb_build_expr(p, fv->value), elem_type);
 				wb_addr_store(p, elem_addr(index), v);
 				index++;
 			}
 		} else {
-			wbValue v = wb_emit_conv(p, wb_build_expr(p, elem), elem_type);
-			wb_addr_store(p, elem_addr(index), v);
+			wbValue v = wb_build_expr(p, elem);
+			Type *vt = v.type != nullptr ? base_type(v.type) : nullptr;
+			if (vt != nullptr && vt->kind == Type_Tuple) {
+				for_array(j, vt->Tuple.variables) {
+					wb_addr_store(p, elem_addr(index), wb_emit_conv(p, wb_tuple_field(p, v, j), elem_type));
+					index++;
+				}
+				continue;
+			}
+			wb_addr_store(p, elem_addr(index), wb_emit_conv(p, v, elem_type));
 			index++;
 		}
 	}
@@ -1790,14 +1905,16 @@ gb_internal i64 wb_compound_lit_elem_count(Slice<Ast *> const &elems, i64 min_va
 			ast_node(fv, FieldValue, elem);
 			if (is_ast_range(fv->field)) {
 				ast_node(ie, BinaryExpr, fv->field);
-				i64 hi = exact_value_to_i64(ie->right->tav.value) - min_value;
+				i64 hi = exact_value_to_i64(ie->right->tav.value()) - min_value;
 				if (ie->op.kind != Token_RangeHalf) {
 					hi += 1;
 				}
 				index = hi;
 			} else {
-				index = exact_value_to_i64(fv->field->tav.value) - min_value + 1;
+				index = exact_value_to_i64(fv->field->tav.value()) - min_value + 1;
 			}
+		} else if (elem->tav.type != nullptr && is_type_tuple(elem->tav.type)) {
+			index += elem->tav.type->Tuple.variables.count;
 		} else {
 			index++;
 		}
@@ -1833,8 +1950,8 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 		} else if (bt->kind == Type_Struct && !is_type_soa_struct(bt) && !bt->Struct.is_raw_union) {
 			// bytes covered by the named/positional top level fields
 			auto covered = array_make<bool>(temporary_allocator(), bt->Struct.fields.count);
-			for_array(i, cl->elems) {
-				Ast *elem = cl->elems[i];
+			isize field_index = 0;
+			for (Ast *elem : cl->elems) {
 				if (elem->kind == Ast_FieldValue) {
 					ast_node(fv, FieldValue, elem);
 					Selection sel = lookup_field(bt, fv->field->Ident.interned, false);
@@ -1842,7 +1959,13 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 						covered[sel.index[0]] = true;
 					}
 				} else {
-					covered[i] = true;
+					isize n = 1;
+					if (elem->tav.type != nullptr && is_type_tuple(elem->tav.type)) {
+						n = elem->tav.type->Tuple.variables.count;
+					}
+					for (isize k = 0; k < n && field_index < covered.count; k++) {
+						covered[field_index++] = true;
+					}
 				}
 			}
 			i64 size = type_size_of(bt);
@@ -1894,10 +2017,18 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 			wb_build_compound_lit_array_elems(p, expr, cl->elems, dst, bt->Struct.soa_elem);
 			return;
 		}
-		for_array(i, cl->elems) {
-			Ast *elem = cl->elems[i];
+		i64 field_index = 0;
+		for (Ast *elem : cl->elems) {
 			wbAddr field_addr = dst;
 			Ast *value_expr = elem;
+			if (elem->kind != Ast_FieldValue && elem->tav.type != nullptr && is_type_tuple(elem->tav.type)) {
+				wbValue tuple = wb_build_expr(p, elem);
+				for_array(j, elem->tav.type->Tuple.variables) {
+					wbAddr ta = wb_addr_field(dst, field_index++);
+					wb_addr_store(p, ta, wb_emit_conv(p, wb_tuple_field(p, tuple, j), ta.type));
+				}
+				continue;
+			}
 			if (elem->kind == Ast_FieldValue) {
 				ast_node(fv, FieldValue, elem);
 				Selection sel = lookup_field(bt, fv->field->Ident.interned, false);
@@ -1911,7 +2042,7 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 				}
 				value_expr = fv->value;
 			} else {
-				field_addr = wb_addr_field(dst, cast(i64)i);
+				field_addr = wb_addr_field(dst, field_index++);
 			}
 			wbValue v = wb_emit_conv(p, wb_build_expr(p, value_expr), field_addr.type);
 			wb_addr_store(p, field_addr, v);
@@ -1950,7 +2081,7 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 	case Type_FixedCapacityDynamicArray:
 		// [dynamic; N]T: {data: [N]T, len: int}
 		wb_build_compound_lit_array_elems(p, expr, cl->elems, dst, bt->FixedCapacityDynamicArray.elem);
-		wb_addr_store(p, wb_addr_offset(dst, type_offset_of(bt, 1, nullptr), t_int), wb_value_const_int(t_int, wb_compound_lit_elem_count(cl->elems)));
+		wb_addr_store(p, wb_addr_offset(dst, type_offset_of(bt, 1, nullptr), t_int), wb_value_const_int(t_int, gb_max(cl->max_count, wb_compound_lit_elem_count(cl->elems))));
 		return;
 	case Type_EnumeratedArray:
 		wb_build_compound_lit_array_elems(p, expr, cl->elems, dst, bt->EnumeratedArray.elem, exact_value_to_i64(*bt->EnumeratedArray.min_value));
@@ -2032,6 +2163,48 @@ gb_internal void wb_build_compound_lit(wbProcedure *p, Ast *expr, wbAddr dst) {
 	case Type_BitSet: {
 		// res |= 1 << (elem - lower) for each (runtime) element
 		Type *it = bit_set_to_int(bt);
+		if (is_type_array(it) && wb_bit_set_is_foreign_endian_array(bt)) {
+			wb_unsupported_type(p, expr, type);
+			return;
+		}
+		if (!wb_is_scalar(bt) && !is_type_different_to_arch_endianness(it)) {
+			wbAddr tmp = wb_add_temp(p, type);
+			wb_addr_zero(p, tmp);
+			wbValue base = wb_addr_get_ptr(p, tmp, t_rawptr);
+			for (Ast *elem : cl->elems) {
+				GB_ASSERT(elem->kind != Ast_FieldValue);
+				wbValue e = wb_emit_conv(p, wb_emit_conv(p, wb_build_expr(p, elem), bt->BitSet.elem), t_i64);
+				if (e.kind == wbValue_Invalid) {
+					return;
+				}
+				wb_push(p, e);
+				wb_i64_const(p, bt->BitSet.lower);
+				wb_op(p, wbOp_i64_sub);
+				wb_op(p, wbOp_i32_wrap_i64);
+				wbValue k = wb_pop_to_local(p, wbValType_i32, t_i32);
+				wb_push(p, base);
+				wb_push(p, k);
+				wb_i32_const(p, 3);
+				wb_op(p, wbOp_i32_shr_u);
+				wb_op(p, wbOp_i32_add);
+				wbValue a = wb_pop_to_local(p, wbValType_i32, t_rawptr);
+				wb_push(p, a);
+				wb_push(p, a);
+				wb_memarg(p, wbOp_i32_load8_u, 0, 1);
+				wb_i32_const(p, 1);
+				wb_push(p, k);
+				wb_i32_const(p, 7);
+				wb_op(p, wbOp_i32_and);
+				wb_op(p, wbOp_i32_shl);
+				wb_op(p, wbOp_i32_or);
+				wb_memarg(p, wbOp_i32_store8, 0, 1);
+			}
+			wb_emit_copy(p, dst.index, dst.offset, tmp.index, tmp.offset, type);
+			return;
+		}
+		if (is_type_array(it)) {
+			it = wb_bit_set_int_type(bt);
+		}
 		Type *set_type = it;
 		it = integer_endian_type_to_platform_type(it);
 		wbValType vt = wb_valtype_of(it);
@@ -2117,8 +2290,16 @@ gb_internal wbValue wb_build_unary_expr(wbProcedure *p, Ast *expr) {
 	}
 
 	wbValType vt = wb_valtype_of(type);
+	if (wb_is_bit_set_wide(type)) {
+		wbValue x = wb_emit_conv(p, wb_build_expr(p, ue->expr), type);
+		if (ue->op.kind == Token_Xor) {
+			return wb_emit_arith_bit_set_wide(p, expr, Token_AndNot, wb_const(p, expr, type, exact_bit_set_all_set_mask(type)), x, type, type);
+		}
+		wb_unsupported(p, expr, "bit_set unary operator");
+		return wb_value_invalid();
+	}
 	if (wb_is_int128(type)) {
-		// -x == 0 - x, ~x == x ~ -1
+		// -x == 0 - x, ~x == x ~ -1; a bit_set complements as mask &~ x so stray bits are cleared
 		wbValue x = wb_emit_conv(p, wb_build_expr(p, ue->expr), type);
 		ExactValue zero = exact_value_i64(0);
 		ExactValue all  = exact_value_i64(-1);
@@ -2129,7 +2310,11 @@ gb_internal wbValue wb_build_unary_expr(wbProcedure *p, Ast *expr) {
 		switch (ue->op.kind) {
 		case Token_Add: return x;
 		case Token_Sub: return wb_emit_arith128(p, expr, Token_Sub, wb_const(p, expr, type, zero), x, type, type);
-		case Token_Xor: return wb_emit_arith128(p, expr, Token_Xor, x, wb_const(p, expr, type, all), type, type);
+		case Token_Xor:
+			if (is_type_bit_set(type)) {
+				return wb_emit_arith128(p, expr, Token_AndNot, wb_const(p, expr, type, all), x, type, type);
+			}
+			return wb_emit_arith128(p, expr, Token_Xor, x, wb_const(p, expr, type, all), type, type);
 		default: break;
 		}
 		wb_unsupported(p, expr, "128-bit unary operator");
@@ -2152,10 +2337,19 @@ gb_internal wbValue wb_build_unary_expr(wbProcedure *p, Ast *expr) {
 		}
 		return wb_value_memory(res.index, res.offset, type);
 	}
-	if (is_type_array_like(type)) {
+	if (is_type_array_like(type) || is_type_simd_vector(type)) {
 		// element-wise: -x == 0 - x, ~x == x ~ -1
 		wbValue x = wb_emit_conv(p, wb_build_expr(p, ue->expr), type);
 		Type *elem = base_array_type(type);
+		if (ue->op.kind == Token_Sub && x.kind == wbValue_Memory && is_type_float(elem) && !is_type_different_to_arch_endianness(elem)) {
+			i64 elem_size = type_size_of(elem);
+			Type *it = elem_size == 2 ? t_u16 : elem_size == 4 ? t_u32 : t_u64;
+			Type *int_type = alloc_type_array(it, get_array_type_count(type));
+			x.type = int_type;
+			wbValue res = wb_emit_arith(p, expr, Token_Xor, x, wb_value_const_int(it, cast(i64)(1ull << (8*elem_size - 1))), int_type, int_type);
+			res.type = type;
+			return res;
+		}
 		switch (ue->op.kind) {
 		case Token_Add: return x;
 		case Token_Sub: return wb_emit_arith(p, expr, Token_Sub, wb_const(p, expr, elem, exact_value_i64(0)), x, type, type);
@@ -2209,9 +2403,11 @@ gb_internal wbValue wb_build_unary_expr(wbProcedure *p, Ast *expr) {
 			ExactValue mask = exact_bit_set_all_set_mask(type);
 			GB_ASSERT(mask.kind == ExactValue_Integer);
 			if (vt == wbValType_i64) {
-				wb_i64_const(p, cast(i64)wb_big_int_bits(&mask.value_integer)); wb_op(p, wbOp_i64_xor);
+				wb_i64_const(p, -1); wb_op(p, wbOp_i64_xor);
+				wb_i64_const(p, cast(i64)wb_big_int_bits(&mask.value_integer)); wb_op(p, wbOp_i64_and);
 			} else {
-				wb_i32_const(p, cast(i32)wb_big_int_bits(&mask.value_integer)); wb_op(p, wbOp_i32_xor);
+				wb_i32_const(p, -1); wb_op(p, wbOp_i32_xor);
+				wb_i32_const(p, cast(i32)wb_big_int_bits(&mask.value_integer)); wb_op(p, wbOp_i32_and);
 				wb_emit_normalize(p, type);
 			}
 		} else if (vt == wbValType_i64) {
@@ -2307,6 +2503,16 @@ gb_internal void wb_load_int128(wbProcedure *p, wbValue v, u32 *lo, u32 *hi) {
 	*hi = wb_emit_load(p, a.index, a.offset + 8, t_u64).index;
 }
 
+gb_internal wbValue wb_emit_int128_shift_amount(wbProcedure *p, wbValue v) {
+	u32 lo, hi;
+	wb_load_int128(p, v, &lo, &hi);
+	wb_local_get(p, lo);
+	wb_i64_const(p, -1);
+	wb_local_get(p, hi); wb_op(p, wbOp_i64_eqz);
+	wb_op(p, wbOp_select);
+	return wb_pop_to_local(p, wbValType_i64, t_u64);
+}
+
 // x << k for k in [0, 64] with Odin semantics (k >= 64 gives 0); x and k on the stack
 gb_internal void wb_emit_shl64_sat(wbProcedure *p, u32 x, u32 k) {
 	wb_local_get(p, x); wb_local_get(p, k); wb_op(p, wbOp_i64_shl);
@@ -2385,7 +2591,16 @@ gb_internal wbValue wb_emit_arith128(wbProcedure *p, Ast *node, TokenKind op, wb
 
 	if (op == Token_Shl || op == Token_Shr) {
 		// amount clamped to [0, 128]
-		wbValue amount = wb_emit_conv(p, right, t_u64);
+		wbValue amount = {};
+		if (wb_is_int128(right.type)) {
+			wbValue wide = wb_emit_conv(p, right, integer_endian_type_to_platform_type(right.type));
+			if (wide.kind == wbValue_Invalid) {
+				return wb_value_invalid();
+			}
+			amount = wb_emit_int128_shift_amount(p, wide);
+		} else {
+			amount = wb_emit_conv(p, right, t_u64);
+		}
 		if (amount.kind == wbValue_Invalid) {
 			return wb_value_invalid();
 		}
@@ -2538,6 +2753,9 @@ gb_internal wbValue wb_emit_arith_array(wbProcedure *p, Ast *node, TokenKind op,
 	if (bt->kind == Type_Array) {
 		elem  = bt->Array.elem;
 		count = bt->Array.count;
+	} else if (bt->kind == Type_SimdVector) {
+		elem  = bt->SimdVector.elem;
+		count = bt->SimdVector.count;
 	} else {
 		GB_ASSERT(bt->kind == Type_EnumeratedArray);
 		elem  = bt->EnumeratedArray.elem;
@@ -2548,11 +2766,15 @@ gb_internal wbValue wb_emit_arith_array(wbProcedure *p, Ast *node, TokenKind op,
 	wbValue left_scalar = {}, right_scalar = {};
 	if (count <= 8 && !is_type_array_like(left.type) && wb_is_scalar(left.type)) {
 		left_scalar = wb_value_to_local(p, wb_emit_conv(p, left, elem));
+	} else if (is_type_matrix(left.type)) {
+		left_scalar = left;
 	} else {
 		left = wb_emit_conv(p, left, type);
 	}
 	if (count <= 8 && !is_type_array_like(right.type) && wb_is_scalar(right.type)) {
 		right_scalar = wb_value_to_local(p, wb_emit_conv(p, right, elem));
+	} else if (is_type_matrix(right.type)) {
+		right_scalar = right;
 	} else {
 		right = wb_emit_conv(p, right, type);
 	}
@@ -2586,8 +2808,8 @@ gb_internal wbValue wb_emit_arith_array(wbProcedure *p, Ast *node, TokenKind op,
 	wb_op(p, wbOp_i32_ge_u);
 	wb_br_if(p, block);
 	wbValue index = wb_value_local(idx, wbValType_i32, t_i32);
-	wbValue l = wb_addr_load(p, wb_emit_elem_addr(p, left.index,  left.offset,  index, elem));
-	wbValue r = wb_addr_load(p, wb_emit_elem_addr(p, right.index, right.offset, index, elem));
+	wbValue l = left_scalar.kind  != wbValue_Invalid ? left_scalar  : wb_addr_load(p, wb_emit_elem_addr(p, left.index,  left.offset,  index, elem));
+	wbValue r = right_scalar.kind != wbValue_Invalid ? right_scalar : wb_addr_load(p, wb_emit_elem_addr(p, right.index, right.offset, index, elem));
 	wbValue v = wb_emit_arith(p, node, op, l, r, elem, elem);
 	if (v.kind == wbValue_Invalid) {
 		return v;
@@ -2680,7 +2902,7 @@ gb_internal wbValue wb_matrix_elem(wbProcedure *p, wbValue m, i64 row, i64 col) 
 	Type *mt = base_type(m.type);
 	Type *elem = mt->Matrix.elem;
 	i64 offset = matrix_indices_to_offset(mt, row, col)*type_size_of(elem);
-	return wb_emit_load(p, m.index, m.offset + cast(i32)offset, elem);
+	return wb_addr_load(p, wb_addr_memory(m.index, m.offset + cast(i32)offset, elem));
 }
 
 gb_internal void wb_matrix_store_elem(wbProcedure *p, wbAddr res, i64 row, i64 col, wbValue v) {
@@ -2693,7 +2915,7 @@ gb_internal void wb_matrix_store_elem(wbProcedure *p, wbAddr res, i64 row, i64 c
 // The i-th element of a fixed array value in memory
 gb_internal wbValue wb_array_elem(wbProcedure *p, wbValue a, i64 i) {
 	Type *elem = base_array_type(a.type);
-	return wb_emit_load(p, a.index, a.offset + cast(i32)(i*type_size_of(elem)), elem);
+	return wb_addr_load(p, wb_addr_memory(a.index, a.offset + cast(i32)(i*type_size_of(elem)), elem));
 }
 
 // sum_k a_k * b_k, where the terms are produced by `term(k)`
@@ -2705,7 +2927,11 @@ gb_internal wbValue wb_emit_dot(wbProcedure *p, Ast *node, Type *elem, i64 count
 		if (t.kind == wbValue_Invalid) {
 			return t;
 		}
-		acc = k == 0 ? wb_value_to_local(p, t) : wb_emit_arith(p, node, Token_Add, acc, t, elem, elem);
+		if (k == 0) {
+			acc = t.kind == wbValue_Memory ? t : wb_value_to_local(p, t);
+		} else {
+			acc = wb_emit_arith(p, node, Token_Add, acc, t, elem, elem);
+		}
 	}
 	return acc;
 }
@@ -2765,6 +2991,11 @@ gb_internal wbValue wb_emit_arith_matrix(wbProcedure *p, Ast *node, TokenKind op
 	Type *xt = base_type(left.type);
 	Type *yt = base_type(right.type);
 	GB_ASSERT(xt->kind == Type_Matrix || yt->kind == Type_Matrix);
+	Type *melem = base_array_type(xt->kind == Type_Matrix ? xt : yt);
+	if ((is_type_array_like(xt) && !are_types_identical(base_array_type(xt), melem)) ||
+	    (is_type_array_like(yt) && !are_types_identical(base_array_type(yt), melem))) {
+		return wb_emit_arith_array(p, node, op, left, right, type);
+	}
 	if (op == Token_Mul && !component_wise) {
 		if (xt->kind == Type_Matrix && yt->kind == Type_Matrix) {
 			return wb_emit_matrix_mul(p, node, left, right, type);
@@ -2792,6 +3023,122 @@ gb_internal wbValue wb_emit_arith_matrix(wbProcedure *p, Ast *node, TokenKind op
 	wbValue res = wb_emit_arith_array(p, node, op, left, right, array_type);
 	res.type = type;
 	return res;
+}
+
+gb_internal wbValue wb_emit_arith_bit_set_wide(wbProcedure *p, Ast *node, TokenKind op, wbValue left, wbValue right, Type *operand_type, Type *result_type) {
+	switch (op) {
+	case Token_Add: op = Token_Or;     break;
+	case Token_Sub: op = Token_AndNot; break;
+	default: break;
+	}
+	left  = wb_emit_conv(p, left,  operand_type);
+	right = wb_emit_conv(p, right, operand_type);
+	if (left.kind == wbValue_Invalid || right.kind == wbValue_Invalid) {
+		return wb_value_invalid();
+	}
+	wbAddr la = wb_value_to_addr(p, left);
+	wbAddr ra = wb_value_to_addr(p, right);
+	i64 size = type_size_of(operand_type);
+	Type *ct = t_u8;
+	if (size % 8 == 0) {
+		ct = t_u64;
+	} else if (size % 4 == 0) {
+		ct = t_u32;
+	} else if (size % 2 == 0) {
+		ct = t_u16;
+	}
+	i64 cs = type_size_of(ct);
+	bool is_64 = cs == 8;
+	wbValType vt = is_64 ? wbValType_i64 : wbValType_i32;
+	wbOp op_and = is_64 ? wbOp_i64_and : wbOp_i32_and;
+	wbOp op_or  = is_64 ? wbOp_i64_or  : wbOp_i32_or;
+	wbOp op_xor = is_64 ? wbOp_i64_xor : wbOp_i32_xor;
+
+	switch (op) {
+	case Token_And:
+	case Token_Or:
+	case Token_Xor:
+	case Token_AndNot: {
+		wbOp wop = op_and;
+		if (op == Token_Or) {
+			wop = op_or;
+		} else if (op == Token_Xor) {
+			wop = op_xor;
+		}
+		wbAddr res = wb_add_temp(p, operand_type);
+		for (i64 off = 0; off < size; off += cs) {
+			wbValue l = wb_emit_load(p, la.index, la.offset + cast(i32)off, ct);
+			wbValue r = wb_emit_load(p, ra.index, ra.offset + cast(i32)off, ct);
+			wb_push(p, l);
+			wb_push(p, r);
+			if (op == Token_AndNot) {
+				if (is_64) wb_i64_const(p, -1); else wb_i32_const(p, -1);
+				wb_op(p, op_xor);
+			}
+			wb_op(p, wop);
+			wb_emit_store(p, res.index, res.offset + cast(i32)off, wb_pop_to_local(p, vt, ct), ct);
+		}
+		return wb_emit_conv(p, wb_value_memory(res.index, res.offset, operand_type), result_type);
+	}
+	case Token_CmpEq:
+	case Token_NotEq:
+	case Token_Lt:
+	case Token_LtEq:
+	case Token_Gt:
+	case Token_GtEq: {
+		bool is_eq = op == Token_CmpEq || op == Token_NotEq;
+		bool strict = op == Token_Lt || op == Token_Gt;
+		bool swap = op == Token_Gt || op == Token_GtEq;
+		wbAddr xa = swap ? ra : la;
+		wbAddr ya = swap ? la : ra;
+		u32 acc = wb_add_local(p, vt);
+		u32 ne = wb_add_local(p, vt);
+		if (is_64) wb_i64_const(p, 0); else wb_i32_const(p, 0);
+		wb_local_set(p, acc);
+		if (is_64) wb_i64_const(p, 0); else wb_i32_const(p, 0);
+		wb_local_set(p, ne);
+		for (i64 off = 0; off < size; off += cs) {
+			wbValue x = wb_emit_load(p, xa.index, xa.offset + cast(i32)off, ct);
+			wbValue y = wb_emit_load(p, ya.index, ya.offset + cast(i32)off, ct);
+			wb_local_get(p, acc);
+			wb_push(p, x);
+			wb_push(p, y);
+			if (is_eq) {
+				wb_op(p, op_xor);
+			} else {
+				if (is_64) wb_i64_const(p, -1); else wb_i32_const(p, -1);
+				wb_op(p, op_xor);
+				wb_op(p, op_and);
+			}
+			wb_op(p, op_or);
+			wb_local_set(p, acc);
+			if (strict) {
+				wb_local_get(p, ne);
+				wb_push(p, x);
+				wb_push(p, y);
+				wb_op(p, op_xor);
+				wb_op(p, op_or);
+				wb_local_set(p, ne);
+			}
+		}
+		wb_local_get(p, acc);
+		wb_op(p, is_64 ? wbOp_i64_eqz : wbOp_i32_eqz);
+		if (op == Token_NotEq) {
+			wb_op(p, wbOp_i32_eqz);
+		}
+		if (strict) {
+			wb_local_get(p, ne);
+			wb_op(p, is_64 ? wbOp_i64_eqz : wbOp_i32_eqz);
+			wb_op(p, wbOp_i32_eqz);
+			wb_op(p, wbOp_i32_and);
+		}
+		return wb_emit_conv(p, wb_pop_to_local(p, wbValType_i32, t_bool), result_type);
+	}
+	default:
+		break;
+	}
+	wb_unsupported(p, node, "bit_set operator");
+	return wb_value_invalid();
 }
 
 gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbValue left, wbValue right, Type *operand_type, Type *result_type) {
@@ -2839,11 +3186,14 @@ gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbVal
 			return wb_emit_conv(p, res, result_type);
 		}
 	}
-	if (is_type_array_like(operand_type) && !wb_is_comparison(op)) {
+	if ((is_type_array_like(operand_type) || is_type_simd_vector(operand_type)) && !wb_is_comparison(op)) {
 		return wb_emit_conv(p, wb_emit_arith_array(p, node, op, left, right, operand_type), result_type);
 	}
 	if ((is_type_complex(operand_type) || is_type_quaternion(operand_type)) && !wb_is_comparison(op)) {
 		return wb_emit_conv(p, wb_emit_arith_complex(p, node, op, left, right, operand_type), result_type);
+	}
+	if (wb_is_bit_set_wide(operand_type)) {
+		return wb_emit_arith_bit_set_wide(p, node, op, left, right, operand_type, result_type);
 	}
 	if (wb_is_int128(operand_type)) {
 		if (is_type_bit_set(operand_type)) {
@@ -2922,6 +3272,55 @@ gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbVal
 	}
 
 	switch (op) {
+	case Token_Quo: {
+		i64 size = type_size_of(core_type(operand_type));
+		if (!is_signed || (vt != wbValType_i32 && vt != wbValType_i64) || (size != 4 && size != 8)) {
+			break;
+		}
+		bool is_64 = vt == wbValType_i64;
+		if (right.kind == wbValue_Const) {
+			if (right.i != -1) {
+				break;
+			}
+			if (is_64) wb_i64_const(p, 0); else wb_i32_const(p, 0);
+			wb_push(p, left);
+			wb_op(p, is_64 ? wbOp_i64_sub : wbOp_i32_sub);
+			return wb_pop_to_local(p, rvt, result_type);
+		}
+		wbValue a = wb_value_to_local(p, left);
+		wbValue b = wb_value_to_local(p, right);
+		wb_push(p, b);
+		if (is_64) { wb_i64_const(p, -1); wb_op(p, wbOp_i64_eq); } else { wb_i32_const(p, -1); wb_op(p, wbOp_i32_eq); }
+		wbValue m1 = wb_pop_to_local(p, wbValType_i32, t_bool);
+		wb_push(p, a);
+		if (is_64) wb_i64_const(p, 1); else wb_i32_const(p, 1);
+		wb_push(p, b);
+		wb_push(p, m1);
+		wb_op(p, wbOp_select);
+		wb_op(p, is_64 ? wbOp_i64_div_s : wbOp_i32_div_s);
+		wbValue q = wb_pop_to_local(p, vt, operand_type);
+		if (is_64) wb_i64_const(p, 0); else wb_i32_const(p, 0);
+		wb_push(p, q);
+		wb_op(p, is_64 ? wbOp_i64_sub : wbOp_i32_sub);
+		wb_push(p, q);
+		wb_push(p, m1);
+		wb_op(p, wbOp_select);
+		return wb_pop_to_local(p, rvt, result_type);
+	}
+	case Token_CmpEq:
+	case Token_NotEq:
+		if (is_type_boolean(core_type(operand_type)) && (vt == wbValType_i32 || vt == wbValType_i64)) {
+			wb_push(p, left);
+			wb_op(p, vt == wbValType_i64 ? wbOp_i64_eqz : wbOp_i32_eqz);
+			wb_push(p, right);
+			wb_op(p, vt == wbValType_i64 ? wbOp_i64_eqz : wbOp_i32_eqz);
+			wb_op(p, op == Token_CmpEq ? wbOp_i32_eq : wbOp_i32_ne);
+			if (rvt == wbValType_i64) {
+				wb_op(p, wbOp_i64_extend_i32_u);
+			}
+			return wb_pop_to_local(p, rvt, result_type);
+		}
+		break;
 	case Token_AndNot:
 		// a &~ b == a & ~b
 		wb_push(p, left);
@@ -2942,9 +3341,16 @@ gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbVal
 	case Token_Shr: {
 		// Odin: shifting by >= bit width gives 0 (or -1 for negative signed >>)
 		i64 bits = 8*type_size_of(core_type(operand_type));
-		wbValue amount = wb_emit_conv(p, right, operand_type);
+		Type *amount_type = operand_type;
+		if (type_size_of(right.type) > type_size_of(operand_type)) {
+			amount_type = integer_endian_type_to_platform_type(right.type);
+		}
+		wbValue amount = wb_emit_conv(p, right, amount_type);
 		if (amount.kind == wbValue_Invalid) {
 			return wb_value_invalid();
+		}
+		if (wb_is_int128(amount_type)) {
+			amount = wb_emit_int128_shift_amount(p, amount);
 		}
 		u32 res = wb_add_local(p, vt);
 		bool const_in_range = amount.kind == wbValue_Const && amount.i >= 0 && amount.i < bits;
@@ -2957,6 +3363,9 @@ gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbVal
 			if (vt == wbValType_i64) wb_i64_const(p, amount.i); else wb_i32_const(p, cast(i32)amount.i);
 		} else {
 			wb_push(p, amount);
+			if (amount.vt == wbValType_i64 && vt == wbValType_i32) {
+				wb_op(p, wbOp_i32_wrap_i64);
+			}
 		}
 		if (vt == wbValType_i64) {
 			if (op == Token_Shl) wb_op(p, wbOp_i64_shl); else wb_op(p, is_signed ? wbOp_i64_shr_s : wbOp_i64_shr_u);
@@ -2978,8 +3387,8 @@ gb_internal wbValue wb_emit_arith(wbProcedure *p, Ast *node, TokenKind op, wbVal
 			if (vt == wbValType_i64) wb_i64_const(p, 0); else wb_i32_const(p, 0);
 		}
 		wb_push(p, amount);
-		if (vt == wbValType_i64) { wb_i64_const(p, bits); wb_op(p, wbOp_i64_lt_u); }
-		else                     { wb_i32_const(p, cast(i32)bits); wb_op(p, wbOp_i32_lt_u); }
+		if (amount.vt == wbValType_i64) { wb_i64_const(p, bits); wb_op(p, wbOp_i64_lt_u); }
+		else                            { wb_i32_const(p, cast(i32)bits); wb_op(p, wbOp_i32_lt_u); }
 		wb_op(p, wbOp_select);
 		wb_emit_normalize(p, result_type);
 		wb_local_set(p, res);
@@ -3126,6 +3535,9 @@ gb_internal wbValue wb_emit_aggregate_compare(wbProcedure *p, Ast *node, TokenKi
 	if (left.kind == wbValue_Invalid || right.kind == wbValue_Invalid) {
 		return wb_value_invalid();
 	}
+	if (wb_is_bit_set_wide(operand_type)) {
+		return wb_emit_arith_bit_set_wide(p, node, op, left, right, operand_type, result_type);
+	}
 	Type *bt = base_type(operand_type);
 	if (is_type_string(bt) && !is_type_cstring(bt)) {
 		char const *name = nullptr;
@@ -3259,6 +3671,42 @@ gb_internal wbValue wb_build_in_expr(wbProcedure *p, Ast *expr) {
 		return wb_value_invalid();
 	}
 	Type *it = bit_set_to_int(rt);
+	if (is_type_array(it)) {
+		if (wb_bit_set_is_foreign_endian_array(rt)) {
+			wb_unsupported_type(p, expr, rt);
+			return wb_value_invalid();
+		}
+		if (!wb_is_scalar(rt)) {
+			right = wb_value_copy(p, right);
+			wbValue base = wb_addr_get_ptr(p, wb_value_to_addr(p, right), t_rawptr);
+			wbValue elem = wb_emit_conv(p, wb_emit_conv(p, wb_build_expr(p, be->left), rt->BitSet.elem), t_i64);
+			if (base.kind == wbValue_Invalid || elem.kind == wbValue_Invalid) {
+				return wb_value_invalid();
+			}
+			wb_push(p, elem);
+			wb_i64_const(p, rt->BitSet.lower);
+			wb_op(p, wbOp_i64_sub);
+			wb_op(p, wbOp_i32_wrap_i64);
+			wbValue k = wb_pop_to_local(p, wbValType_i32, t_i32);
+			wb_push(p, base);
+			wb_push(p, k);
+			wb_i32_const(p, 3);
+			wb_op(p, wbOp_i32_shr_u);
+			wb_op(p, wbOp_i32_add);
+			wb_memarg(p, wbOp_i32_load8_u, 0, 1);
+			wb_push(p, k);
+			wb_i32_const(p, 7);
+			wb_op(p, wbOp_i32_and);
+			wb_op(p, wbOp_i32_shr_u);
+			wb_i32_const(p, 1);
+			wb_op(p, wbOp_i32_and);
+			if (be->op.kind == Token_not_in) {
+				wb_op(p, wbOp_i32_eqz);
+			}
+			return wb_pop_to_local(p, wbValType_i32, result_type);
+		}
+		it = wb_bit_set_int_type(rt);
+	}
 	// endian-specific sets are tested as their platform integer
 	right.type = it;
 	right = wb_emit_to_platform_endian(p, right);
@@ -3348,7 +3796,7 @@ gb_internal wbValue wb_emit_logical_binary(wbProcedure *p, Ast *expr, TokenKind 
 }
 
 gb_internal bool wb_is_empty_string_constant(Ast *expr) {
-	return expr->tav.value.kind == ExactValue_String && is_type_string(expr->tav.type) && expr->tav.value.value_string.len == 0;
+	return expr->tav.value().kind == ExactValue_String && is_type_string(expr->tav.type) && expr->tav.value().value_string.len == 0;
 }
 
 gb_internal wbValue wb_build_binary_expr(wbProcedure *p, Ast *expr) {
@@ -3880,7 +4328,7 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 		i64 elem_size = type_size_of(elem);
 		wbAddr res = wb_add_temp(p, type);
 		for (isize i = 1; i < args.count; i++) {
-			i64 index = exact_value_to_i64(args[i]->tav.value);
+			i64 index = exact_value_to_i64(args[i]->tav.value());
 			wb_emit_copy(p, res.index, res.offset + cast(i32)((i-1)*elem_size),
 			             src.index, src.offset + cast(i32)(index*elem_size), elem);
 		}
@@ -4094,6 +4542,65 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 		Type *tuple = type;
 		Type *et = nullptr;
 		type_offset_of(tuple, 0, &et);
+		if (wb_is_int128(et)) {
+			bool is_signed = wb_type_is_signed(et);
+			wbValue a = wb_emit_conv(p, wb_build_expr(p, args[0]), et);
+			if (wb_expr_has_call(args[1])) a = wb_value_fresh(p, a);
+			wbValue b = wb_emit_conv(p, wb_build_expr(p, args[1]), et);
+			if (a.kind == wbValue_Invalid || b.kind == wbValue_Invalid) return wb_value_invalid();
+			a = wb_value_copy(p, a);
+			b = wb_value_copy(p, b);
+			TokenKind op = Token_Add;
+			switch (id) {
+			case BuiltinProc_overflow_add: op = Token_Add; break;
+			case BuiltinProc_overflow_sub: op = Token_Sub; break;
+			case BuiltinProc_overflow_mul: op = Token_Mul; break;
+			}
+			wbValue r = wb_value_copy(p, wb_emit_arith128(p, expr, op, a, b, et, et));
+			u32 overflow = wb_add_local(p, wbValType_i32);
+			if (id == BuiltinProc_overflow_mul) {
+				u32 alo, ahi, blo, bhi;
+				wb_load_int128(p, a, &alo, &ahi);
+				wb_load_int128(p, b, &blo, &bhi);
+				wb_i32_const(p, 0);
+				wb_local_set(p, overflow);
+				wb_local_get(p, alo); wb_local_get(p, ahi); wb_op(p, wbOp_i64_or); wb_i64_const(p, 0); wb_op(p, wbOp_i64_ne);
+				wb_open_if(p);
+				wbValue q = wb_emit_arith128(p, expr, Token_Quo, r, a, et, et);
+				wbValue ne = wb_emit_arith128(p, expr, Token_NotEq, q, b, et, t_bool);
+				wb_push(p, ne);
+				if (is_signed) {
+					wb_local_get(p, alo); wb_i64_const(p, -1); wb_op(p, wbOp_i64_eq);
+					wb_local_get(p, ahi); wb_i64_const(p, -1); wb_op(p, wbOp_i64_eq);
+					wb_op(p, wbOp_i32_and);
+					wb_local_get(p, blo); wb_op(p, wbOp_i64_eqz);
+					wb_op(p, wbOp_i32_and);
+					wb_local_get(p, bhi); wb_i64_const(p, INT64_MIN); wb_op(p, wbOp_i64_eq);
+					wb_op(p, wbOp_i32_and);
+					wb_op(p, wbOp_i32_or);
+				}
+				wb_local_set(p, overflow);
+				wb_close(p);
+			} else if (is_signed) {
+				wbValue x = wb_emit_arith128(p, expr, Token_Xor, a, r, et, et);
+				wbValue y = op == Token_Add ? wb_emit_arith128(p, expr, Token_Xor, b, r, et, et) : wb_emit_arith128(p, expr, Token_Xor, a, b, et, et);
+				wbValue m = wb_emit_arith128(p, expr, Token_And, x, y, et, et);
+				u32 mlo, mhi;
+				wb_load_int128(p, m, &mlo, &mhi);
+				wb_local_get(p, mhi); wb_i64_const(p, 0); wb_op(p, wbOp_i64_lt_s);
+				wb_local_set(p, overflow);
+			} else {
+				wbValue lt = op == Token_Add ? wb_emit_arith128(p, expr, Token_Lt, r, a, et, t_bool) : wb_emit_arith128(p, expr, Token_Lt, a, b, et, t_bool);
+				wb_push(p, lt);
+				wb_local_set(p, overflow);
+			}
+			wbAddr res = wb_add_temp(p, tuple);
+			Type *bt = nullptr;
+			i64 bool_offset = type_offset_of(tuple, 1, &bt);
+			wb_addr_store(p, wb_addr_memory(res.index, res.offset, et), r);
+			wb_emit_store(p, res.index, res.offset + cast(i32)bool_offset, wb_value_local(overflow, wbValType_i32, t_bool), t_bool);
+			return wb_value_memory(res.index, res.offset, tuple);
+		}
 		wbValType evt = wb_valtype_of(et);
 		if (evt != wbValType_i32 && evt != wbValType_i64) {
 			wb_unsupported_type(p, expr, et);
@@ -4409,6 +4916,62 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 		if (size != 1) { wb_i32_const(p, cast(i32)size); wb_op(p, wbOp_i32_div_s); }
 		return wb_pop_to_local(p, wbValType_i32, type);
 	}
+	case BuiltinProc_c_va_start: {
+		wbValue list = wb_build_expr(p, args[0]);
+		Entity *e = entity_of_node(args[1]);
+		wbAddr *found = e != nullptr ? map_get(&p->variables, e) : nullptr;
+		if (list.kind == wbValue_Invalid) return wb_value_invalid();
+		if (found == nullptr || found->kind != wbAddr_Memory) {
+			wb_unsupported(p, expr, "c_va_start outside of a C variadic procedure");
+			return wb_value_invalid();
+		}
+		wbValue buffer = wb_addr_get_ptr(p, *found, t_rawptr);
+		wb_addr_store(p, wb_addr_from_pointer(p, list, t_rawptr), buffer);
+		return wb_value_invalid();
+	}
+	case BuiltinProc_c_va_end: {
+		wb_build_expr(p, args[0]);
+		return wb_value_invalid();
+	}
+	case BuiltinProc_c_va_copy: {
+		wbValue dst = wb_build_expr(p, args[0]);
+		if (wb_expr_has_call(args[1])) dst = wb_value_fresh(p, dst);
+		wbValue src = wb_build_expr(p, args[1]);
+		if (dst.kind == wbValue_Invalid || src.kind == wbValue_Invalid) return wb_value_invalid();
+		wbValue cur = wb_addr_load(p, wb_addr_from_pointer(p, src, t_rawptr));
+		wb_addr_store(p, wb_addr_from_pointer(p, dst, t_rawptr), cur);
+		return wb_value_invalid();
+	}
+	case BuiltinProc_c_va_arg: {
+		Type *arg_type = type;
+		if (core_type(type)->kind == Type_BitSet) {
+			arg_type = bit_set_to_int(core_type(type));
+		}
+		Type *promoted = c_vararg_promote_type(arg_type);
+		if (!wb_abi_is_basic(promoted)) {
+			wb_unsupported(p, expr, "aggregate C variadic argument");
+			return wb_value_invalid();
+		}
+		wbValue list = wb_build_expr(p, args[0]);
+		if (list.kind == wbValue_Invalid) return wb_value_invalid();
+		wbAddr list_addr = wb_addr_from_pointer(p, list, t_rawptr);
+		wbValue cur = wb_addr_load(p, list_addr);
+		i64 align = gb_max(type_align_of(promoted), 4);
+		wb_push(p, cur);
+		wb_i32_const(p, cast(i32)(align-1));
+		wb_op(p, wbOp_i32_add);
+		wb_i32_const(p, cast(i32)(-align));
+		wb_op(p, wbOp_i32_and);
+		wbValue at = wb_pop_to_local(p, wbValType_i32, t_rawptr);
+		wb_push(p, at);
+		wb_i32_const(p, cast(i32)gb_max(type_size_of(promoted), 4));
+		wb_op(p, wbOp_i32_add);
+		wbValue next = wb_pop_to_local(p, wbValType_i32, t_rawptr);
+		wb_addr_store(p, list_addr, next);
+		wbValue v = wb_addr_load(p, wb_addr_from_pointer(p, at, promoted));
+		v = wb_emit_conv(p, v, arg_type);
+		return wb_emit_transmute(p, v, type);
+	}
 	case BuiltinProc_real:
 	case BuiltinProc_imag:
 	case BuiltinProc_jmag:
@@ -4438,6 +5001,10 @@ gb_internal wbValue wb_build_builtin_call_internal(wbProcedure *p, Ast *expr, Bu
 	case BuiltinProc_read_cycle_counter_frequency:
 		// wasm has no cycle counter
 		return wb_value_const_int(type, 0);
+	case BuiltinProc_frame_address:
+	case BuiltinProc_stack_pointer:
+		wb_global_get(p, p->module->global_stack_pointer);
+		return wb_pop_to_local(p, wbValType_i32, type);
 
 	case BuiltinProc_transpose: {
 		wbValue m = wb_build_expr(p, args[0]);
@@ -4698,6 +5265,7 @@ gb_internal wbValue wb_emit_call(wbProcedure *p, Type *pt, wbProcedure *callee, 
 	for_array(i, leaves) {
 		wb_emit_store(p, addr.index, addr.offset + cast(i32)leaves[i].offset, tmps[i], leaves[i].type);
 	}
+	wb_emit_zero_gaps(p, addr.index, addr.offset, leaves, type_size_of(pt->Proc.results));
 	return wb_value_memory(addr.index, addr.offset, result_type);
 }
 
@@ -4790,7 +5358,7 @@ gb_internal void wb_add_defer_proc(wbProcedure *p, Ast *expr, Entity *e, Array<w
 	auto values = array_make<wbValue>(permanent_allocator(), 0, in_args.count+4);
 	auto exprs  = array_make<Ast *>(temporary_allocator(), 0, in_args.count+4);
 	if (use_in) {
-		Type *ct = base_type(e->type);
+		Type *ct = base_type(type_of_expr(ce->proc));
 		isize variadic_index = ct->Proc.variadic ? ct->Proc.variadic_index : (ct->Proc.params ? ct->Proc.params->Tuple.variables.count : 0);
 		Slice<Ast *> const &positional = ce->split_args->positional;
 		bool positional_map = true; // positional[i] corresponds to parameter i
@@ -4963,10 +5531,6 @@ gb_internal wbValue wb_build_call_expr_internal(wbProcedure *p, Ast *expr) {
 			return proc_value;
 		}
 		proc_value = wb_value_fresh(p, proc_value);
-	}
-	if (c_vararg && (callee == nullptr || !callee->is_foreign)) {
-		wb_unsupported(p, expr, "indirect C variadic procedure call");
-		return wb_value_invalid();
 	}
 
 	GB_ASSERT(ce->split_args != nullptr);
@@ -5374,9 +5938,14 @@ gb_internal wbValue wb_build_slice_expr(wbProcedure *p, Ast *expr) {
 		else if (bt->kind == Type_DynamicArray) elem_type = bt->DynamicArray.elem;
 		else if (is_type_string16(bt)) elem_type = t_u16;
 		else elem_type = t_u8;
-	} else if (bt->kind == Type_MultiPointer) {
+	} else if (bt->kind == Type_MultiPointer || (bt->kind == Type_Pointer && is_type_multi_pointer(type_deref(bt)))) {
 		wbValue ptr = wb_build_expr(p, se->expr);
 		if (ptr.kind == wbValue_Invalid) return ptr;
+		if (bt->kind == Type_Pointer) {
+			Type *pointee = type_deref(bt);
+			ptr = wb_addr_load(p, wb_addr_from_pointer(p, ptr, pointee));
+			bt = base_type(pointee);
+		}
 		data = wb_value_to_local(p, ptr);
 		elem_type = bt->MultiPointer.elem;
 		if (se->high == nullptr) {
@@ -5492,7 +6061,7 @@ gb_internal wbValue wb_build_expr_internal(wbProcedure *p, Ast *expr) {
 			return wb_addr_load(p, addr);
 		}
 		if (e->kind == Entity_Procedure) {
-			return wb_value_const_int(tv.type, wb_table_index(p->module, wb_procedure_for_entity(p->module, e)));
+			return wb_value_const_int(e->type, wb_table_index(p->module, wb_procedure_for_entity(p->module, e)));
 		}
 		if (e->kind == Entity_Constant) {
 			return wb_const(p, expr, tv.type, e->Constant.value);

@@ -24,8 +24,8 @@ test_tlsf_bitscan :: proc(t: ^testing.T) {
 		{.fls,      u32 (0x0000_0000_8000_0008), 31},
 		{.fls,      u32 (0x0000_0000_7FFF_FFFF), 30},
 		{.fls_uint, uint(0x0000_0000_8000_0000), 31},
-		{.fls_uint, uint(0x0000_0001_0000_0000), 32},
-		{.fls_uint, uint(0xffff_ffff_ffff_ffff), 63},
+		{.fls_uint, uint(1) << (size_of(uint) * 4), size_of(uint) * 4},
+		{.fls_uint, max(uint),                      size_of(uint) * 8 - 1},
 	}
 
 	for test in Tests {
@@ -38,7 +38,7 @@ test_tlsf_bitscan :: proc(t: ^testing.T) {
 			testing.expectf(t, res == test.exp, "Expected tlsf.fls(0x%08x) == %v, got %v", test.v, test.exp, res)
 		case .fls_uint:
 			res := tlsf.fls_uint(test.v.?)
-			testing.expectf(t, res == test.exp, "Expected tlsf.fls_uint(0x%16x) == %v, got %v", test.v, test.exp, res)
+			testing.expectf(t, res == test.exp, "Expected tlsf.fls_uint(0x%016x) == %v, got %v", test.v, test.exp, res)
 		}
 	}
 }

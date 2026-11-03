@@ -95,7 +95,15 @@ gb_internal wbValue wb_build_atomic_call(wbProcedure *p, Ast *expr, BuiltinProcI
 
 		wbValue old = wb_value_fresh(p, wb_addr_load(p, dst));
 		if (old.kind == wbValue_Invalid) return old;
-		wbValue ok = wb_emit_compare(p, expr, Token_CmpEq, old, expected, elem, t_bool);
+		wbValue ok = {};
+		if (is_type_float(elem)) {
+			Type *bits_type = t_u16;
+			if (type_size_of(elem) == 4) bits_type = t_u32;
+			if (type_size_of(elem) == 8) bits_type = t_u64;
+			ok = wb_emit_compare(p, expr, Token_CmpEq, wb_emit_transmute(p, old, bits_type), wb_emit_transmute(p, expected, bits_type), bits_type, t_bool);
+		} else {
+			ok = wb_emit_compare(p, expr, Token_CmpEq, old, expected, elem, t_bool);
+		}
 		if (ok.kind == wbValue_Invalid) return ok;
 		ok = wb_value_to_local(p, ok);
 

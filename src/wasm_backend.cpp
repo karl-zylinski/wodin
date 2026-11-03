@@ -109,7 +109,11 @@ gb_internal u16 wb_f32_to_f16_bits(f32 value) {
 	u32 mant = i & 0x7fffff;
 	if (((i >> 23) & 0xff) == 0xff) {
 		// inf or nan
-		return cast(u16)(sign | 0x7c00 | (mant ? 0x200 | (mant >> 13) : 0));
+		if (mant == 0) {
+			return cast(u16)(sign | 0x7c00);
+		}
+		mant >>= 13;
+		return cast(u16)(sign | 0x7c00 | mant | (mant == 0));
 	}
 	if (exp >= 0x1f) {
 		return cast(u16)(sign | 0x7c00);
@@ -187,6 +191,34 @@ gb_internal wbValType wb_valtype_of(Type *t) {
 
 gb_internal bool wb_is_scalar(Type *t) {
 	return wb_valtype_of(t) != wbValType_Invalid;
+}
+
+gb_internal Type *wb_bit_set_int_type(Type *t) {
+	Type *it = bit_set_to_int(t);
+	if (!is_type_array(it)) {
+		return it;
+	}
+	switch (type_size_of(t)) {
+	case 1:  return t_u8;
+	case 2:  return t_u16;
+	case 4:  return t_u32;
+	case 8:  return t_u64;
+	case 16: return t_u128;
+	}
+	return nullptr;
+}
+
+gb_internal bool wb_bit_set_is_foreign_endian_array(Type *t) {
+	Type *it = bit_set_to_int(t);
+	return is_type_array(it) && is_type_different_to_arch_endianness(base_array_type(it));
+}
+
+gb_internal bool wb_is_bit_set_wide(Type *t) {
+	if (!is_type_bit_set(t)) {
+		return false;
+	}
+	i64 size = type_size_of(t);
+	return size > 0 && size != 1 && size != 2 && size != 4 && size != 8 && size != 16;
 }
 
 gb_internal bool wb_type_is_signed(Type *t) {
@@ -656,7 +688,10 @@ gb_internal wbProcedure *wb_lookup_runtime_procedure(wbModule *m, char const *na
 	Entity *e = scope_lookup_current(pkg->scope, string_interner_insert(make_string_c(name)));
 	GB_ASSERT_MSG(e != nullptr, "Runtime procedure not found: %s", name);
 	wbProcedure *p = wb_procedure_for_entity(m, e);
-	if (string_ends_with(p->name, str_lit("_error")) || string_starts_with(p->name, str_lit("type_assertion_check"))) {
+	if (string_ends_with(p->name, str_lit("_error")) ||
+	    string_ends_with(p->name, str_lit("_error_contextless")) ||
+	    string_ends_with(p->name, str_lit("_error_with_context")) ||
+	    string_starts_with(p->name, str_lit("type_assertion_check"))) {
 		// Only reached when a check the backend emitted inline has already failed
 		p->never_inline = true;
 	}
@@ -728,7 +763,7 @@ gb_internal void wb_push(wbProcedure *p, wbValue v) {
 		switch (v.vt) {
 		case wbValType_i32: wb_i32_const(p, cast(i32)v.i); break;
 		case wbValType_i64: wb_i64_const(p, v.i);          break;
-		case wbValType_f32: wb_f32_const(p, cast(f32)v.f); break;
+		case wbValType_f32: wb_f32_const(p, f64_to_f32(v.f)); break;
 		case wbValType_f64: wb_f64_const(p, v.f);          break;
 		default: GB_PANIC("invalid constant type"); break;
 		}
@@ -789,6 +824,9 @@ gb_internal void wb_emit_normalize(wbProcedure *p, Type *type) {
 gb_internal i32 wb_alloc_slot(wbProcedure *p, i64 size, i64 align) {
 	if (align < 1) align = 1;
 	if (size < 0) size = 0;
+	if (align > 16 && cast(u32)align > p->frame_align) {
+		p->frame_align = cast(u32)align;
+	}
 	p->frame_size = cast(u32)((p->frame_size + align-1) & ~(align-1));
 	i32 offset = cast(i32)p->frame_size;
 	p->frame_size += cast(u32)size;
@@ -1157,6 +1195,19 @@ gb_internal void wb_emit_zero(wbProcedure *p, u32 base, i32 offset, Type *type) 
 		zero.type = leaf.type;
 		wb_emit_store(p, base, offset + cast(i32)leaf.offset, zero, leaf.type);
 		done = leaf.offset + type_size_of(leaf.type);
+	}
+	if (size > done) {
+		wb_emit_zero(p, base, offset + cast(i32)done, size - done);
+	}
+}
+
+gb_internal void wb_emit_zero_gaps(wbProcedure *p, u32 base, i32 offset, Array<wbAbiLeaf> const &leaves, i64 size) {
+	i64 done = 0;
+	for (wbAbiLeaf const &leaf : leaves) {
+		if (leaf.offset > done) {
+			wb_emit_zero(p, base, offset + cast(i32)done, leaf.offset - done);
+		}
+		done = gb_max(done, leaf.offset + type_size_of(leaf.type));
 	}
 	if (size > done) {
 		wb_emit_zero(p, base, offset + cast(i32)done, size - done);
@@ -1580,6 +1631,27 @@ gb_internal void wb_write_le_int(u8 *dst, BigInt const *x, i64 size) {
 		wb_write_le(dst, wb_big_int_bits(x), size);
 		return;
 	}
+	if (size > 16) {
+		BigInt rest = {};
+		BigInt next = {};
+		mp_init(&rest);
+		mp_init(&next);
+		mp_abs(x, &rest);
+		u64 carry = 1;
+		for (i64 off = 0; off < size; off += 8) {
+			u64 word = mp_get_u64(&rest);
+			mp_div_2d(&rest, 64, &next, nullptr);
+			mp_exch(&rest, &next);
+			if (x->sign) {
+				word = ~word + carry;
+				carry = (carry != 0 && word == 0) ? 1 : 0;
+			}
+			wb_write_le(dst + off, word, gb_min(size - off, cast(i64)8));
+		}
+		mp_clear(&rest);
+		mp_clear(&next);
+		return;
+	}
 	// 128 bits: the magnitude's two words, negated in two's complement if needed
 	BigInt mag = {};
 	mp_init(&mag);
@@ -1694,7 +1766,8 @@ gb_internal Type *wb_union_const_real_variant(Type *u, ExactValue const &v, Ast 
 		switch (v.kind) {
 		case ExactValue_Bool:      fits = is_type_boolean(vt); break;
 		case ExactValue_Integer:   fits = is_type_integer(vt) || is_type_enum(vt); break;
-		case ExactValue_Float:     fits = is_type_float(vt); break;
+		case ExactValue_Float:
+		case ExactValue_Rational:  fits = is_type_float(vt); break;
 		case ExactValue_String:    fits = is_type_string(vt) || is_type_cstring(vt); break;
 		case ExactValue_Pointer:   fits = is_type_pointer(vt) || is_type_multi_pointer(vt); break;
 		case ExactValue_Procedure: fits = is_type_proc(vt); break;
@@ -1740,7 +1813,7 @@ gb_internal bool wb_const_is_splat(Type *array_type, ExactValue const &value) {
 		if (expr == nullptr) {
 			expr = v.value_variant;
 		}
-		v = v.value_variant->tav.value;
+		v = v.value_variant->tav.value();
 	}
 	Type *vt = nullptr;
 	if (v.kind == ExactValue_Compound) {
@@ -1779,9 +1852,13 @@ gb_internal bool wb_const_is_splat(Type *array_type, ExactValue const &value) {
 	}
 }
 
-gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &value, u8 *dst) {
+gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &value_, u8 *dst) {
 	if (is_type_untyped(type)) {
 		type = default_type(type);
+	}
+	ExactValue value = value_;
+	if (value.kind == ExactValue_Rational) {
+		value = exact_value_to_float(value);
 	}
 	Type *bt = base_type(type);
 	i64 size = type_size_of(type);
@@ -1815,7 +1892,7 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 		return;
 	}
 
-	if (bt->kind == Type_Union && value.kind != ExactValue_Invalid) {
+	if (bt->kind == Type_Union && (value.kind != ExactValue_Invalid || (value.variant_type != nullptr && !are_types_identical(base_type(value.variant_type), bt)))) {
 		// Constant union value: the variant's data followed by its tag
 		ExactValue v = value;
 		Ast *expr = nullptr; // the expression the constant came from, when it is known
@@ -1824,7 +1901,7 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 			if (expr == nullptr) {
 				expr = v.value_variant;
 			}
-			v = v.value_variant->tav.value;
+			v = v.value_variant->tav.value();
 		}
 		Type *variant_type = v.variant_type;
 		if (v.kind == ExactValue_Compound) {
@@ -1921,21 +1998,21 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 		Type *ft = base_complex_elem_type(type);
 		i64 fs = type_size_of(ft);
 		if (is_type_quaternion(type)) {
-			wb_write_const_data(m, ft, exact_value_float(value.value_complex->imag), dst + 0*fs);
-			wb_write_const_data(m, ft, exact_value_float(value.value_complex->real), dst + 3*fs);
+			wb_write_const_data(m, ft, exact_value_to_float(value.value_complex->imag), dst + 0*fs);
+			wb_write_const_data(m, ft, exact_value_to_float(value.value_complex->real), dst + 3*fs);
 		} else {
-			wb_write_const_data(m, ft, exact_value_float(value.value_complex->real), dst + 0*fs);
-			wb_write_const_data(m, ft, exact_value_float(value.value_complex->imag), dst + 1*fs);
+			wb_write_const_data(m, ft, exact_value_to_float(value.value_complex->real), dst + 0*fs);
+			wb_write_const_data(m, ft, exact_value_to_float(value.value_complex->imag), dst + 1*fs);
 		}
 		return;
 	}
 	case ExactValue_Quaternion: {
 		Type *ft = base_complex_elem_type(type);
 		i64 fs = type_size_of(ft);
-		wb_write_const_data(m, ft, exact_value_float(value.value_quaternion->imag), dst + 0*fs);
-		wb_write_const_data(m, ft, exact_value_float(value.value_quaternion->jmag), dst + 1*fs);
-		wb_write_const_data(m, ft, exact_value_float(value.value_quaternion->kmag), dst + 2*fs);
-		wb_write_const_data(m, ft, exact_value_float(value.value_quaternion->real), dst + 3*fs);
+		wb_write_const_data(m, ft, exact_value_to_float(value.value_quaternion->imag), dst + 0*fs);
+		wb_write_const_data(m, ft, exact_value_to_float(value.value_quaternion->jmag), dst + 1*fs);
+		wb_write_const_data(m, ft, exact_value_to_float(value.value_quaternion->kmag), dst + 2*fs);
+		wb_write_const_data(m, ft, exact_value_to_float(value.value_quaternion->real), dst + 3*fs);
 		return;
 	}
 	write_float:
@@ -1947,9 +2024,9 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 			return;
 		}
 		if (size == 2 && is_type_float(core_type(type))) {
-			wb_write_le(dst, wb_f32_to_f16_bits(cast(f32)value.value_float), 2);
+			wb_write_le(dst, wb_f32_to_f16_bits(f64_to_f32(value.value_float)), 2);
 		} else if (size == 4) {
-			f32 f = cast(f32)value.value_float;
+			f32 f = f64_to_f32(value.value_float);
 			u32 bits = 0;
 			gb_memmove(&bits, &f, 4);
 			wb_write_le(dst, bits, 4);
@@ -2109,8 +2186,8 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 					TypeAndValue tav = type_and_value_of_expr(fv->value);
 					if (is_ast_range(fv->field)) {
 						ast_node(ie, BinaryExpr, fv->field);
-						i64 lo = exact_value_to_i64(ie->left->tav.value) - min_value;
-						i64 hi = exact_value_to_i64(ie->right->tav.value) - min_value;
+						i64 lo = exact_value_to_i64(ie->left->tav.value()) - min_value;
+						i64 hi = exact_value_to_i64(ie->right->tav.value()) - min_value;
 						if (ie->op.kind != Token_RangeHalf) {
 							hi += 1;
 						}
@@ -2119,7 +2196,7 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 						}
 						index = hi;
 					} else {
-						index = exact_value_to_i64(fv->field->tav.value) - min_value;
+						index = exact_value_to_i64(fv->field->tav.value()) - min_value;
 						wb_write_const_data(m, et, tav.value, dst + elem_offset(index));
 						index++;
 					}
@@ -2144,14 +2221,10 @@ gb_internal void wb_write_const_data(wbModule *m, Type *type, ExactValue const &
 			if (count == 0) {
 				return;
 			}
+			count = gb_max(cast(i64)cl->max_count, count);
 			u8 *elems = gb_alloc_array(temporary_allocator(), u8, count*elem_size);
 			gb_zero_size(elems, count*elem_size);
-			for_array(i, cl->elems) {
-				Ast *elem = cl->elems[i];
-				GB_ASSERT(elem->kind != Ast_FieldValue);
-				TypeAndValue tav = type_and_value_of_expr(elem);
-				wb_write_const_data(m, et, tav.value, elems + i*elem_size);
-			}
+			wb_write_const_data(m, alloc_type_array(et, count), value, elems);
 			u32 addr = wb_data_alloc(m, count*elem_size, type_align_of(et));
 			wb_data_write(m, addr, elems, count*elem_size);
 			wb_write_le(dst, addr, build_context.ptr_size);
@@ -2228,6 +2301,9 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 	if (value.kind == ExactValue_Invalid) {
 		return true;
 	}
+	if (value.kind == ExactValue_Rational) {
+		return wb_can_serialize_const(type, exact_value_to_float(value));
+	}
 	Type *bt = base_type(type);
 	if (bt->kind == Type_Union) {
 		ExactValue v = value;
@@ -2236,7 +2312,7 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 			if (expr == nullptr) {
 				expr = v.value_variant;
 			}
-			v = v.value_variant->tav.value;
+			v = v.value_variant->tav.value();
 		}
 		if (v.kind == ExactValue_Compound && (v.variant_type == nullptr || are_types_identical(base_type(v.variant_type), bt))) {
 			return true; // nil
@@ -2264,9 +2340,10 @@ gb_internal bool wb_can_serialize_const(Type *type, ExactValue const &value) {
 		// `any` is 16 bytes too and is not this: an integer put in an `any` is
 		// a pointer and a typeid, made at startup
 		return wb_is_scalar(type) || is_type_complex(bt) || is_type_quaternion(bt) || (type_size_of(type) == 16 && !is_type_any(bt)) ||
+		       (wb_is_bit_set_wide(bt) && value.kind == ExactValue_Integer) ||
 		       (bt->kind == Type_SimdVector && wb_is_scalar(bt->SimdVector.elem)) ||
-		       (bt->kind == Type_Array && wb_is_scalar(bt->Array.elem)) ||
-		       (bt->kind == Type_EnumeratedArray && wb_is_scalar(bt->EnumeratedArray.elem)) ||
+		       (bt->kind == Type_Array && (wb_is_scalar(bt->Array.elem) || (is_type_array_like(bt->Array.elem) && wb_can_serialize_const(bt->Array.elem, value)))) ||
+		       (bt->kind == Type_EnumeratedArray && (wb_is_scalar(bt->EnumeratedArray.elem) || (is_type_array_like(bt->EnumeratedArray.elem) && wb_can_serialize_const(bt->EnumeratedArray.elem, value)))) ||
 		       (bt->kind == Type_Matrix && wb_is_scalar(bt->Matrix.elem));
 	case ExactValue_Complex:
 		return is_type_complex(bt) || is_type_quaternion(bt);
@@ -2342,7 +2419,11 @@ gb_internal u32 wb_global_addr(wbModule *m, Entity *e, Ast *init_expr = nullptr)
 		return *found;
 	}
 	Type *type = e->type;
-	u32 addr = wb_data_alloc(m, type_size_of(type), type_align_of(type));
+	i64 align = type_align_of(type);
+	if (e->kind == Entity_Variable) {
+		align = gb_max(align, e->Variable.custom_align);
+	}
+	u32 addr = wb_data_alloc(m, type_size_of(type), align);
 	map_set(&m->globals, e, addr);
 
 	if (init_expr == nullptr && e->decl_info != nullptr) {
@@ -2371,6 +2452,9 @@ gb_internal wbValue wb_const(wbProcedure *p, Ast *node, Type *type, ExactValue c
 		type = default_type(type);
 	}
 	ExactValue value = value_;
+	if (value.kind == ExactValue_Rational) {
+		value = exact_value_to_float(value);
+	}
 	if (value.kind == ExactValue_String16) {
 		// UTF-16 constants are interned by their UTF-8 form
 		value = exact_value_string(string16_to_string(permanent_allocator(), value.value_string16));
@@ -2439,7 +2523,7 @@ gb_internal wbValue wb_const(wbProcedure *p, Ast *node, Type *type, ExactValue c
 		if (vt == wbValType_f32 || vt == wbValType_f64) {
 			v.f = exact_value_to_f64(value);
 		} else if (wb_is_f16(type)) {
-			v.i = wb_f32_to_f16_bits(cast(f32)exact_value_to_f64(value));
+			v.i = wb_f32_to_f16_bits(f64_to_f32(exact_value_to_f64(value)));
 		} else {
 			v.i = cast(i64)wb_big_int_bits(&value.value_integer);
 		}
@@ -2448,7 +2532,7 @@ gb_internal wbValue wb_const(wbProcedure *p, Ast *node, Type *type, ExactValue c
 		if (vt == wbValType_f32 || vt == wbValType_f64) {
 			v.f = value.value_float;
 		} else if (wb_is_f16(type)) {
-			v.i = wb_f32_to_f16_bits(cast(f32)value.value_float);
+			v.i = wb_f32_to_f16_bits(f64_to_f32(value.value_float));
 		} else {
 			v.i = cast(i64)value.value_float;
 		}
@@ -2588,6 +2672,9 @@ gb_internal wbAddr wb_add_variable(wbProcedure *p, Entity *e, Ast *init_expr) {
 	} else if (wb_is_scalar(e->type) && !ptr_set_exists(&p->addressed, e)) {
 		u32 idx = wb_add_local(p, wb_valtype_of(e->type), e->token.string);
 		addr = wb_addr_local(idx, e->type);
+	} else if (e->kind == Entity_Variable && e->Variable.custom_align > type_align_of(e->type)) {
+		i32 offset = wb_alloc_slot(p, type_size_of(e->type), e->Variable.custom_align);
+		addr = wb_addr_memory(p->fp_local, offset, e->type);
 	} else {
 		addr = wb_add_temp(p, e->type);
 	}
@@ -2598,7 +2685,8 @@ gb_internal wbAddr wb_add_variable(wbProcedure *p, Entity *e, Ast *init_expr) {
 gb_internal void wb_finish_procedure(wbProcedure *p) {
 	wb_optimize_procedure(p);
 
-	// Frame setup: sp = old_sp - frame_size (kept 16 byte aligned). The
+	// Frame setup: sp = old_sp - frame_size, aligned to max(16, frame_align)
+	// (an i32.and rounds fp down when a slot needs more than 16). The
 	// optimizer has removed the epilogues of procedures without a frame.
 	// The prologue is not part of the instruction stream (the procedure may
 	// be finished again after inlining).
@@ -2607,11 +2695,16 @@ gb_internal void wb_finish_procedure(wbProcedure *p) {
 	p->code = p->prologue;
 	p->code.data.count = 0;
 	if (p->frame_size > 0) {
-		u32 size = (p->frame_size + 15) & ~15u;
+		u32 align = gb_max(p->frame_align, 16u);
+		u32 size = (p->frame_size + align-1) & ~(align-1);
 		wb_global_get(p, p->module->global_stack_pointer);
 		wb_local_tee(p, p->old_sp_local);
 		wb_i32_const(p, cast(i32)size);
 		wb_op(p, wbOp_i32_sub);
+		if (align > 16) {
+			wb_i32_const(p, -cast(i32)align);
+			wb_op(p, wbOp_i32_and);
+		}
 		wb_local_tee(p, p->fp_local);
 		wb_global_set(p, p->module->global_stack_pointer);
 	} else if (p->uses_alloca) {
@@ -2646,6 +2739,9 @@ gb_internal void wb_build_procedure(wbProcedure *p) {
 			if (e->kind == Entity_Variable) {
 				pl.leaves = array_make<wbAbiLeaf>(temporary_allocator(), 0, 8);
 				pl.direct = wb_abi_flatten(e->type, pt->Proc.calling_convention, 0, &pl.leaves);
+				if (pt->Proc.c_vararg && (e->flags & EntityFlag_CVarArg)) {
+					pl.direct = false;
+				}
 				if (!pl.direct) {
 					pl.first = wb_add_local(p, wbValType_i32, e->token.string);
 				} else if (pl.leaves.count > 0) {
@@ -2687,6 +2783,7 @@ gb_internal void wb_build_procedure(wbProcedure *p) {
 					u32 idx = pl.first + cast(u32)j;
 					wb_emit_store(p, addr.index, addr.offset + cast(i32)leaf.offset, wb_value_local(idx, p->locals[idx].vt, leaf.type), leaf.type);
 				}
+				wb_emit_zero_gaps(p, addr.index, addr.offset, pl.leaves, type_size_of(e->type));
 				map_set(&p->variables, e, addr);
 			}
 		}

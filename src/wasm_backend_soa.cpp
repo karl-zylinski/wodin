@@ -251,7 +251,7 @@ gb_internal wbAddr wb_soa_container_of_expr(wbProcedure *p, Ast *expr) {
 	}
 	TypeAndValue tav = type_and_value_of_expr(expr);
 	if (tav.mode == Addressing_Variable) {
-		wbAddr addr = wb_addr_resolve_map(p, wb_build_addr(p, expr));
+		wbAddr addr = wb_addr_resolve_map_or_zero(p, wb_build_addr(p, expr));
 		if (addr.kind == wbAddr_Memory || addr.kind == wbAddr_Invalid) {
 			return addr;
 		}

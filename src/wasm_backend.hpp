@@ -480,6 +480,7 @@ struct wbProcedure {
 	u32        fp_local;       // frame pointer (lowest address of the frame)
 	u32        old_sp_local;   // stack pointer on entry
 	u32        frame_size;     // bytes of stack frame, known after lowering
+	u32        frame_align;
 	bool       uses_alloca;    // the stack pointer moves during the body: the epilogue must restore it
 	Array<wbFrameSlot> slots;  // frame allocations
 	Array<wbLocal> locals;     // all locals, params first

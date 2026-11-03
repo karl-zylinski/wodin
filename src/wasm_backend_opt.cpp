@@ -3515,8 +3515,10 @@ gb_internal void wb_inline_body(wbProcedure *p, wbProcedure *c) {
 	// The callee frame becomes a region of the caller frame
 	u32 region = 0;
 	if (c->frame_size > 0) {
-		region = (p->frame_size + 15) & ~15u;
+		u32 align = gb_max(c->frame_align, 16u);
+		region = (p->frame_size + align-1) & ~(align-1);
 		p->frame_size = region + c->frame_size;
+		p->frame_align = gb_max(p->frame_align, c->frame_align);
 		for (wbFrameSlot slot : c->slots) {
 			slot.offset += region;
 			array_add(&p->slots, slot);
@@ -3870,6 +3872,7 @@ gb_internal wbProcedure *wb_spec_copy(wbModule *m, Array<wbSpecCopy> *copies, wb
 	p->fp_local      = c->fp_local;
 	p->old_sp_local  = c->old_sp_local;
 	p->frame_size    = c->frame_size;
+	p->frame_align   = c->frame_align;
 	p->state_flags   = c->state_flags;
 	for (wbFrameSlot slot : c->slots) array_add(&p->slots, slot);
 	for (wbLocal l : c->locals)       array_add(&p->locals, l);

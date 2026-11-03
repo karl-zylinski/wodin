@@ -270,7 +270,8 @@ gb_internal bool  platform_virtual_memory_commit_internal(void *data, isize comm
 		return true;
 	}
 #elif defined(GB_SYSTEM_WASI)
-	// WebAssembly has no virtual memory: blocks are zeroed heap allocations
+	// WebAssembly has no virtual memory: blocks are zeroed, page aligned heap
+	// allocations (the arena's alignment arithmetic assumes what mmap gives)
 	// that are committed from the start, and the guard pages stay accessible
 	gb_internal void platform_virtual_memory_init(void) {
 		global_platform_memory_block_sentinel.prev = &global_platform_memory_block_sentinel;
@@ -278,7 +279,11 @@ gb_internal bool  platform_virtual_memory_commit_internal(void *data, isize comm
 	}
 
 	gb_internal void *platform_virtual_memory_alloc_internal(isize total_size, bool commit) {
-		void *mem = calloc(1, total_size);
+		total_size = align_formula_isize(total_size, DEFAULT_PAGE_SIZE);
+		void *mem = aligned_alloc(DEFAULT_PAGE_SIZE, total_size);
+		if (mem != nullptr) {
+			memset(mem, 0, total_size);
+		}
 		if (mem == nullptr) {
 			gb_printf_err("Out of memory, oh no...\n");
 			gb_printf_err("Requested: %lld bytes\n", cast(long long)total_size);
@@ -433,12 +438,14 @@ ArenaTemp arena_temp_begin(Arena *arena) {
 	GB_ASSERT(arena);
 	GB_ASSERT(arena->parent_thread == get_current_thread());
 
+	if (arena->curr_block == nullptr) {
+		arena_alloc(arena, 0, 1);
+	}
+
 	ArenaTemp temp = {};
 	temp.arena = arena;
 	temp.block = arena->curr_block;
-	if (arena->curr_block != nullptr) {
-		temp.used = arena->curr_block->used;
-	}
+	temp.used  = arena->curr_block->used;
 	arena->temp_count += 1;
 	return temp;
 }
@@ -469,8 +476,8 @@ void arena_temp_end(ArenaTemp const &temp) {
 		MemoryBlock *block = arena->curr_block;
 		if (block) {
 			GB_ASSERT_MSG(block->used >= temp.used, "out of order use of arena_temp_end");
-			isize amount_to_zero = gb_min(block->used - temp.used, block->size - block->used);
-			gb_zero_size(block->base + temp.used, amount_to_zero);
+			// `arena_alloc` expects the memory to be zeroed already
+			gb_zero_size(block->base + temp.used, block->used - temp.used);
 			block->used = temp.used;
 		}
 	}
@@ -646,16 +653,14 @@ gb_internal gbAllocator permanent_allocator() {
 }
 
 gb_internal gbAllocator temporary_allocator() {
-	// return {thread_arena_allocator_proc, cast(void *)cast(uintptr)ThreadArena_Temporary};
-	return permanent_allocator();
+	return {thread_arena_allocator_proc, cast(void *)cast(uintptr)ThreadArena_Temporary};
 }
 
 
 #define TEMP_ARENA_GUARD(arena) ArenaTempGuard GB_DEFER_3(_arena_guard_){arena}
 
 
-// #define TEMPORARY_ALLOCATOR_GUARD() TEMP_ARENA_GUARD(get_arena(ThreadArena_Temporary))
-#define TEMPORARY_ALLOCATOR_GUARD()
+#define TEMPORARY_ALLOCATOR_GUARD() TEMP_ARENA_GUARD(get_arena(ThreadArena_Temporary))
 #define PERMANENT_ALLOCATOR_GUARD()
 
 

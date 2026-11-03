@@ -54,16 +54,16 @@ fi
 # Timings are stripped, they never agree.
 summary() {
 	local line
-	line=$(grep -m1 "^Finished\|Error:\|error:" "$1" | sed 's/ in [0-9.]*[a-zµ]*:/:/' | cut -c1-140)
+	line=$(grep -m1 "^Finished\|Error:\|error:" "$1" | sed 's/ in [0-9.]*[a-zµ]*:/:/; s/\.ref\.wasm`/.wasm`/' | cut -c1-140)
 	if [ -z "$line" ]; then
-		line="exit $2, output $(sed '/^Error: failed to run main module/,$d' "$1" | sha1sum | cut -c1-10) ($(wc -l < "$1") lines)"
+		line="exit $2, output $(sed '/^Error: failed to run main module/,$d; s/random seed: [0-9]*/random seed: N/' "$1" | sha1sum | cut -c1-10) ($(wc -l < "$1") lines)"
 	fi
 	echo "$line"
 }
 
 # `odin test` for a file or package with tests in it, `odin run` otherwise
 mode_of() {
-	if grep -rq "@(test)" "$1"; then echo test; else echo run; fi
+	if grep -rqE "@\(test\)|@test\b" "$1"; then echo test; else echo run; fi
 }
 
 differ=0

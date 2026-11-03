@@ -54,10 +54,6 @@ gb_internal wbProcedure *wb_hasher_proc_for_type(wbModule *m, Type *type) {
 // `proc "contextless" (a, b: rawptr) -> bool`
 gb_internal wbProcedure *wb_equal_proc_for_type(wbModule *m, Type *type) {
 	type = base_type(type);
-	if (type->kind == Type_Matrix) {
-		// padding-free: compare the stored elements
-		type = alloc_type_array(type->Matrix.elem, matrix_type_total_internal_elems(type));
-	}
 	GB_ASSERT(t_equal_proc != nullptr);
 	return wb_gen_proc_for_type(m, "__$equal", type, t_equal_proc, wbProcGen_Equal);
 }
@@ -91,7 +87,7 @@ gb_internal wbValue wb_emit_hash_value(wbProcedure *p, Type *type, wbValue data,
 		args[0] = data;
 		args[1] = seed;
 		args[2] = wb_value_const_int(t_int, type_size_of(type));
-		return wb_emit_runtime_call(p, "default_hasher", args);
+		return wb_emit_runtime_call(p, runtime_default_hasher_fixed_name(m->info), args);
 	}
 
 	switch (type->kind) {
@@ -129,9 +125,17 @@ gb_internal wbValue wb_emit_hash_value(wbProcedure *p, Type *type, wbValue data,
 		return res;
 	}
 	case Type_Array:
-	case Type_EnumeratedArray: {
-		Type *elem = type->kind == Type_Array ? type->Array.elem : type->EnumeratedArray.elem;
-		i64 count  = type->kind == Type_Array ? type->Array.count : type->EnumeratedArray.count;
+	case Type_EnumeratedArray:
+	case Type_Matrix:
+	case Type_SimdVector: {
+		Type *elem = base_array_type(type);
+		i64 count = 0;
+		switch (type->kind) {
+		case Type_Array:           count = type->Array.count;                       break;
+		case Type_EnumeratedArray: count = type->EnumeratedArray.count;             break;
+		case Type_Matrix:          count = matrix_type_total_internal_elems(type); break;
+		case Type_SimdVector:      count = type->SimdVector.count;                  break;
+		}
 		i64 elem_size = type_size_of(elem);
 		wbProcedure *elem_hasher = wb_hasher_proc_for_type(m, elem);
 
@@ -170,7 +174,12 @@ gb_internal wbValue wb_emit_hash_value(wbProcedure *p, Type *type, wbValue data,
 		break;
 	}
 
-	if (is_type_cstring(type)) {
+	if (is_type_cstring16(type) || is_type_string16(type)) {
+		auto args = array_make<wbValue>(temporary_allocator(), 2);
+		args[0] = data;
+		args[1] = seed;
+		return wb_emit_runtime_call(p, is_type_cstring16(type) ? "default_hasher_cstring16" : "default_hasher_string16", args);
+	} else if (is_type_cstring(type)) {
 		auto args = array_make<wbValue>(temporary_allocator(), 2);
 		args[0] = data;
 		args[1] = seed;
@@ -216,6 +225,10 @@ gb_internal void wb_build_hasher_body(wbProcedure *p) {
 // Whether the values of `type` at the two pointers are equal, as an i32 value
 gb_internal wbValue wb_emit_equal_at(wbProcedure *p, Type *type, wbValue lhs, wbValue rhs) {
 	Type *bt = base_type(type);
+	if (bt->kind == Type_Matrix) {
+		Type *bytes = alloc_type_array(t_u8, type_size_of(bt));
+		return wb_emit_aggregate_compare(p, nullptr, Token_CmpEq, wb_value_memory(lhs.index, 0, bytes), wb_value_memory(rhs.index, 0, bytes), bytes, t_bool);
+	}
 	if (wb_is_scalar(type) || wb_is_int128(type)) {
 		wbValue l = wb_addr_load(p, wb_addr_memory(lhs.index, 0, type));
 		wbValue r = wb_addr_load(p, wb_addr_memory(rhs.index, 0, type));
@@ -309,9 +322,10 @@ gb_internal void wb_build_equal_body(wbProcedure *p) {
 		return;
 	}
 	case Type_Array:
-	case Type_EnumeratedArray: {
-		Type *elem = type->kind == Type_Array ? type->Array.elem : type->EnumeratedArray.elem;
-		i64 count  = type->kind == Type_Array ? type->Array.count : type->EnumeratedArray.count;
+	case Type_EnumeratedArray:
+	case Type_SimdVector: {
+		Type *elem = base_array_type(type);
+		i64 count  = type->kind == Type_Array ? type->Array.count : type->kind == Type_EnumeratedArray ? type->EnumeratedArray.count : type->SimdVector.count;
 		i64 elem_size = type_size_of(elem);
 		wb_i32_const(p, 0);
 		wbValue i = wb_pop_to_local(p, wbValType_i32, t_int);
@@ -821,6 +835,28 @@ gb_internal wbAddr wb_addr_resolve_map(wbProcedure *p, wbAddr addr) {
 	return wb_addr_from_pointer(p, wb_map_get_ptr(p, addr, nullptr), value_type);
 }
 
+gb_internal wbAddr wb_addr_resolve_map_or_zero(wbProcedure *p, wbAddr addr) {
+	if (addr.kind != wbAddr_Map) {
+		return addr;
+	}
+	Type *value_type = base_type(addr.map_type)->Map.value;
+	wbValue ptr = wb_map_get_ptr(p, addr, nullptr);
+	if (ptr.kind == wbValue_Invalid) {
+		wbAddr invalid = {};
+		return invalid;
+	}
+	ptr = wb_value_to_local(p, ptr);
+	wbAddr zero = wb_add_temp(p, value_type);
+	wb_addr_zero(p, zero);
+	wbValue zero_ptr = wb_addr_get_ptr(p, zero, ptr.type);
+	wb_push(p, ptr);
+	wb_push(p, zero_ptr);
+	wb_push(p, ptr);
+	wb_op(p, wbOp_select);
+	wbValue res = wb_pop_to_local(p, wbValType_i32, ptr.type);
+	return wb_addr_from_pointer(p, res, value_type);
+}
+
 // `len(m)`
 gb_internal wbValue wb_emit_map_len(wbProcedure *p, wbValue m) {
 	GB_ASSERT(m.kind == wbValue_Memory);
@@ -854,7 +890,7 @@ gb_internal void wb_build_range_map(wbProcedure *p, AstRangeStmt *rs, Ast *node,
 		expr_type = type_deref(expr_type);
 		map = wb_addr_from_pointer(p, wb_build_expr(p, range_expr), expr_type);
 	} else {
-		map = wb_build_addr(p, range_expr);
+		map = wb_addr_resolve_map_or_zero(p, wb_build_addr(p, range_expr));
 	}
 	if (map.kind != wbAddr_Memory) {
 		return;

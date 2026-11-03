@@ -306,8 +306,8 @@ gb_internal wbValue wb_build_simd_builtin(wbProcedure *p, Ast *expr, BuiltinProc
 			case BuiltinProc_simd_bit_or:      r = wb_emit_arith(p, expr, Token_Or,     x, y, elem, elem); break;
 			case BuiltinProc_simd_bit_xor:     r = wb_emit_arith(p, expr, Token_Xor,    x, y, elem, elem); break;
 			case BuiltinProc_simd_bit_and_not: r = wb_emit_arith(p, expr, Token_AndNot, x, y, elem, elem); break;
-			case BuiltinProc_simd_shl:         r = wb_emit_arith(p, expr, Token_Shl,    x, wb_emit_conv(p, y, elem), elem, elem); break;
-			case BuiltinProc_simd_shr:         r = wb_emit_arith(p, expr, Token_Shr,    x, wb_emit_conv(p, y, elem), elem, elem); break;
+			case BuiltinProc_simd_shl:         r = wb_emit_arith(p, expr, Token_Shl,    x, y, elem, elem); break;
+			case BuiltinProc_simd_shr:         r = wb_emit_arith(p, expr, Token_Shr,    x, y, elem, elem); break;
 			case BuiltinProc_simd_shl_masked:
 			case BuiltinProc_simd_shr_masked: {
 				// the shift amount wraps around the lane width
